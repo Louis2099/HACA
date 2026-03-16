@@ -16,6 +16,7 @@
 """MuJoCo simulation wrapper."""
 
 import os
+import time as _time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -42,6 +43,10 @@ class SimState:
     """Root angular velocity in root frame, shape (3,)."""
     joint_effort: torch.Tensor | None = None
     """Joint efforts/torques, shape (num_joints,). Optional."""
+    anchor_body_pos: torch.Tensor | None = None
+    """Anchor body position in world frame, shape (3,). Populated when motion_tracking is configured."""
+    anchor_body_quat: torch.Tensor | None = None
+    """Anchor body orientation quaternion [w, x, y, z], shape (4,). Populated when motion_tracking is configured."""
 
 
 @dataclass
@@ -68,6 +73,9 @@ class DummyViewer:
     def sync(self):
         pass
 
+    def is_running(self):
+        return True
+
 
 class MuJocoSimulation:
     """MuJoCo simulation wrapper."""
@@ -93,6 +101,10 @@ class MuJocoSimulation:
         self.device = device
         self.config = config
         self.command_manager = command_manager
+
+        # Pause / single-step control (toggled via keyboard).
+        self.paused = enable_viewer
+        self.step_once = False
 
         # Get MJCF path.
         if mjcf_path is not None:
@@ -164,9 +176,7 @@ class MuJocoSimulation:
 
         # Setup viewer.
         if enable_viewer and "DISPLAY" in os.environ:
-            self.viewer = mujoco.viewer.launch_passive(
-                self.mj_model, self.mj_data, key_callback=self._key_callback if command_manager else None
-            )
+            self.viewer = mujoco.viewer.launch_passive(self.mj_model, self.mj_data, key_callback=self._key_callback)
             # Configure camera.
             with self.viewer.lock():
                 self.viewer.cam.lookat[:] = [0, 0, 1.0]
@@ -174,18 +184,37 @@ class MuJocoSimulation:
                 self.viewer.cam.azimuth = 135.0
                 self.viewer.cam.elevation = -20.0
 
-            # Print keyboard controls if command manager is active
-            if self.command_manager is not None:
-                self._print_keyboard_help()
+            self._print_keyboard_help()
         else:
             self.viewer = DummyViewer()
             self.viewer.__enter__()
+
+        # Setup anchor body tracking for motion tracking tasks.
+        motion_tracking = config.get("motion_tracking")
+        if motion_tracking and "anchor_body_name" in motion_tracking:
+            anchor_name = motion_tracking["anchor_body_name"]
+            self._anchor_body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, anchor_name)
+            if self._anchor_body_id < 0:
+                raise ValueError(f"Anchor body '{anchor_name}' not found in MJCF model")
+            print(f"  Anchor body: {anchor_name} (body_id={self._anchor_body_id})")
+        else:
+            self._anchor_body_id = None
 
         # Setup velocity sensors.
         self._setup_sensors()
 
         # Set initial configuration.
         self._set_initial_configuration(config)
+
+        # Push force disturbance state.
+        self._push_force_magnitude = 100.0  # Newtons
+        self._push_sign = 0.0  # +1 or -1
+        self._push_axis = 0  # 0 = body x (fwd/bwd), 1 = body y (left/right)
+        self._push_expiry = 0.0
+        push_body_name = "torso_link"
+        self._push_body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, push_body_name)
+        if self._push_body_id < 0:
+            self._push_body_id = 1  # fallback to first non-world body
 
     def _has_freejoint(self) -> bool:
         """Check if model has a freejoint (floating base)."""
@@ -263,16 +292,78 @@ class MuJocoSimulation:
             print("Warning: 'linear-acceleration' sensor not found")
 
     def _set_initial_configuration(self, config: dict):
-        """Set initial joint positions from config."""
+        """Set initial joint positions from config.
+
+        Reads ``articulations.robot.default_joint_pos`` (in IsaacLab joint order)
+        and maps them to MuJoCo joint order so the robot starts in the correct
+        default pose.  The mapped positions are stored in ``_default_qpos`` and
+        written to ``mj_data.qpos`` on every ``reset()`` call.
+        """
+        # Default qpos for the full configuration vector.
+        import numpy as np
+
+        self._default_qpos = np.zeros(self.mj_model.nq)
+
         # Set default root position for floating base robots.
         if not self.fixed_base:
-            self.mj_model.qpos0[:3] = [0.0, 0.0, 0.9]
-            self.mj_model.qpos0[3:7] = [1.0, 0.0, 0.0, 0.0]
+            self._default_qpos[:3] = [0.0, 0.0, 0.76]
+            self._default_qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
+
+        # Apply default joint positions from config (YAML/policy joint order -> MJCF order).
+        robot_cfg = config.get("articulations", {}).get("robot", {})
+        default_joint_pos = robot_cfg.get("default_joint_pos")
+        yaml_joint_names = robot_cfg.get("joint_names")
+
+        if default_joint_pos is not None and yaml_joint_names is not None:
+            if len(default_joint_pos) != len(yaml_joint_names):
+                print(
+                    f"Warning: default_joint_pos ({len(default_joint_pos)}) and "
+                    f"joint_names ({len(yaml_joint_names)}) have different lengths"
+                )
+                return
+
+            # Map from YAML joint order to MJCF joint order using jnt_qposadr.
+            for yaml_idx, jname in enumerate(yaml_joint_names):
+                jnt_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, jname)
+                if jnt_id >= 0:
+                    qpos_addr = self.mj_model.jnt_qposadr[jnt_id]
+                    self._default_qpos[qpos_addr] = default_joint_pos[yaml_idx]
+                else:
+                    print(f"Warning: joint '{jname}' from config not found in MJCF model")
+
+            print(f"  Applied default joint positions from config ({len(yaml_joint_names)} joints)")
+
+        # Override MJCF joint frictionloss and damping for all actuated joints.
+        # frictionloss: MJCF has 0.2, set to 0.1 (matching holosoma G1) for
+        # realistic Coulomb friction while being less aggressive than the MJCF default.
+        # damping: MJCF has 0.05, zero it out since the PD controller already
+        # handles all damping via kd gains.
+        for i in range(self.mj_model.njnt):
+            if self.mj_model.jnt_type[i] != mujoco.mjtJoint.mjJNT_FREE:
+                dof_addr = self.mj_model.jnt_dofadr[i]
+                self.mj_model.dof_frictionloss[dof_addr] = 0.1
+                self.mj_model.dof_damping[dof_addr] = 0.0
+        print("  Set joint frictionloss=0.1, damping=0.0 for all actuated joints")
+
+        # Apply per-joint armature from config to match training dynamics.
+        # The MJCF uses a flat armature=0.01 for all joints, but training uses
+        # per-joint values ranging from 0.0036 to 0.025.
+        default_joint_armature = robot_cfg.get("default_joint_armature")
+        if default_joint_armature is not None and yaml_joint_names is not None:
+            for yaml_idx, jname in enumerate(yaml_joint_names):
+                jnt_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, jname)
+                if jnt_id >= 0:
+                    dof_addr = self.mj_model.jnt_dofadr[jnt_id]
+                    self.mj_model.dof_armature[dof_addr] = default_joint_armature[yaml_idx]
+            print(f"  Applied joint armature from config ({len(yaml_joint_names)} joints)")
 
     def reset(self):
         """Reset simulation to initial state."""
         mujoco.mj_resetData(self.mj_model, self.mj_data)
+        # Apply stored default configuration directly to qpos.
+        self.mj_data.qpos[:] = self._default_qpos
         self.mj_data.ctrl[:] = 0
+        self._push_sign = 0.0
         # Forward kinematics to compute derived quantities.
         mujoco.mj_forward(self.mj_model, self.mj_data)
 
@@ -304,9 +395,22 @@ class MuJocoSimulation:
             if self._root_linear_velocity_sensor is not None:
                 root_lin_vel = torch.from_numpy(self._root_linear_velocity_sensor.data.copy()).to(self.device)
             else:
-                # Fallback: Convert world frame velocity to root frame.
+                # Fallback: Compute COM velocity from body origin velocity.
+                # qvel[:3] is the world-frame velocity of the body origin (joint frame),
+                # but IsaacLab reports root_lin_vel as the COM velocity.
+                # v_com = v_origin + omega x (R * com_local)
+                from agile.sim2mujoco.utils import quat_apply
+
                 world_lin_vel = torch.from_numpy(self.mj_data.qvel[:3].copy()).to(self.device)
-                root_lin_vel = self._world_to_root_frame(world_lin_vel, root_quat)
+                # root_lin_vel = self._world_to_root_frame(world_lin_vel, root_quat)
+                world_ang_vel = torch.from_numpy(self.mj_data.qvel[3:6].copy()).to(self.device)
+
+                root_body_id = self.mj_model.jnt_bodyid[0]
+                com_local = torch.from_numpy(self.mj_model.body_ipos[root_body_id].copy()).to(self.device)
+                com_world = quat_apply(root_quat, com_local)
+
+                world_com_vel = world_lin_vel + torch.cross(world_ang_vel, com_world, dim=0)
+                root_lin_vel = self._world_to_root_frame(world_com_vel, root_quat)
 
             if self._root_angular_velocity_sensor is not None:
                 root_ang_vel = torch.from_numpy(self._root_angular_velocity_sensor.data.copy()).to(self.device)
@@ -315,6 +419,18 @@ class MuJocoSimulation:
                 world_ang_vel = torch.from_numpy(self.mj_data.qvel[3:6].copy()).to(self.device)
                 root_ang_vel = self._world_to_root_frame(world_ang_vel, root_quat)
 
+        if self.fixed_base:
+            joint_effort = torch.from_numpy(self.mj_data.qfrc_actuator.copy()).to(self.device)
+        else:
+            joint_effort = torch.from_numpy(self.mj_data.qfrc_actuator[6:].copy()).to(self.device)
+
+        # Anchor body state (for motion tracking tasks).
+        anchor_body_pos = None
+        anchor_body_quat = None
+        if self._anchor_body_id is not None:
+            anchor_body_pos = torch.from_numpy(self.mj_data.xpos[self._anchor_body_id].copy()).to(self.device)
+            anchor_body_quat = torch.from_numpy(self.mj_data.xquat[self._anchor_body_id].copy()).to(self.device)
+
         return SimState(
             joint_pos=joint_pos,
             joint_vel=joint_vel,
@@ -322,7 +438,9 @@ class MuJocoSimulation:
             root_quat=root_quat,
             root_lin_vel=root_lin_vel,
             root_ang_vel=root_ang_vel,
-            joint_effort=None,  # Populated during control if needed.
+            joint_effort=joint_effort,
+            anchor_body_pos=anchor_body_pos,
+            anchor_body_quat=anchor_body_quat,
         )
 
     def step(self, joint_cmd: JointCommand):
@@ -363,11 +481,17 @@ class MuJocoSimulation:
             # Map joint order to actuator order (matching isaac-deploy line 350).
             self.mj_data.ctrl[:] = torques[self._joint_to_ctrl_indices].cpu().numpy()
 
+        # Apply push force disturbance if active.
+        if self._push_sign != 0.0 and _time.time() < self._push_expiry:
+            xmat = self.mj_data.xmat[self._push_body_id].reshape(3, 3)
+            direction = xmat[:, self._push_axis]  # body x or y axis in world frame
+            self.mj_data.xfrc_applied[self._push_body_id, :3] = self._push_sign * self._push_force_magnitude * direction
+        else:
+            self.mj_data.xfrc_applied[self._push_body_id, :] = 0
+            self._push_sign = 0.0
+
         # Step simulation.
         mujoco.mj_step(self.mj_model, self.mj_data)
-
-        # Update viewer.
-        self.viewer.sync()
 
     def close(self):
         """Close simulation and viewer."""
@@ -376,15 +500,37 @@ class MuJocoSimulation:
 
     def _key_callback(self, key: int):
         """
-        Keyboard callback for command control.
+        Keyboard callback for simulation and command control.
 
         Args:
             key: GLFW key code.
         """
-        if self.command_manager is None:
+        import glfw
+
+        # --- Pause / step controls (always active) ---
+        if key == glfw.KEY_SPACE:
+            self.paused = not self.paused
+            print(f"{'⏸  PAUSED' if self.paused else '▶  RUNNING'}")
+            return
+        elif key == glfw.KEY_N:
+            self.step_once = True
             return
 
-        import glfw
+        # --- Push force disturbance ---
+        if key in (glfw.KEY_F, glfw.KEY_B, glfw.KEY_G, glfw.KEY_V):
+            directions = {
+                glfw.KEY_F: (1.0, 0),  # forward  (+x body axis)
+                glfw.KEY_B: (-1.0, 0),  # backward (-x body axis)
+                glfw.KEY_G: (1.0, 1),  # left     (+y body axis)
+                glfw.KEY_V: (-1.0, 1),  # right    (-y body axis)
+            }
+            self._push_sign, self._push_axis = directions[key]
+            self._push_expiry = _time.time() + 0.15
+            return
+
+        # --- Command manager controls (only when available) ---
+        if self.command_manager is None:
+            return
 
         # Forward/Backward (Arrow Up/Down or I/K)
         if key == glfw.KEY_UP or key == glfw.KEY_I:
@@ -418,8 +564,8 @@ class MuJocoSimulation:
             self.command_manager.update_height(-self.command_manager.height_step)
             self.command_manager.print_status()
 
-        # STOP - Reset to defaults (SPACE or H for "Home")
-        elif key == glfw.KEY_SPACE or key == glfw.KEY_H:
+        # STOP - Reset to defaults (H for "Home")
+        elif key == glfw.KEY_H:
             self.command_manager.stop()
 
         # Print status (P)
@@ -429,16 +575,22 @@ class MuJocoSimulation:
     def _print_keyboard_help(self):
         """Print keyboard control instructions."""
         print("\n" + "=" * 80)
-        print("⌨️  KEYBOARD CONTROLS (Interactive Command Mode)")
+        print("⌨️  KEYBOARD CONTROLS")
         print("=" * 80)
         print("  ⚠️  NOTE: Click on the MuJoCo viewer window to enable keyboard input!")
         print("=" * 80)
-        print("  ↑ / I     or  ↓ / K      : Forward / Backward    (±0.1 m/s,   [-0.5, 0.5])")
-        print("  ← / J     or  → / L      : Left / Right strafe   (±0.1 m/s,   [-0.5, 0.5])")
-        print("  U         or  O          : Turn Left / Right     (±0.2 rad/s, [-1.0, 1.0])")
-        print("  PgUp / 9  or  PgDn / 0   : Height Up / Down      (±0.05 m,    [0.3, 0.8])")
-        print("  SPACE / H                : STOP (reset to 0.0, 0.0, 0.0, 0.72)")
-        print("  P                        : Print current status")
+        print("  SPACE                    : Pause / Resume simulation")
+        print("  N                        : Step one frame (while paused)")
+        print("  F / B (hold)             : Push robot forward / backward (100 N)")
+        print("  G / V (hold)             : Push robot left / right      (100 N)")
+        if self.command_manager is not None:
+            print("  " + "-" * 56)
+            print("  ↑ / I     or  ↓ / K      : Forward / Backward    (±0.1 m/s,   [-0.5, 0.5])")
+            print("  ← / J     or  → / L      : Left / Right strafe   (±0.1 m/s,   [-0.5, 0.5])")
+            print("  U         or  O          : Turn Left / Right     (±0.2 rad/s, [-1.0, 1.0])")
+            print("  PgUp / 9  or  PgDn / 0   : Height Up / Down      (±0.05 m,    [0.3, 0.8])")
+            print("  H                        : STOP (reset commands to defaults)")
+            print("  P                        : Print current status")
         print("=" * 80)
-        print("  💡 Use Arrow Keys for easy control, or I/J/K/L (vim-style)")
+        print("  ⏸  Simulation starts PAUSED. Press SPACE to begin.")
         print("=" * 80 + "\n")

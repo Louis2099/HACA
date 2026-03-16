@@ -13,11 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Observation computation with history support."""
+"""Observation computation with history support and motion tracking."""
 
 import torch
 
-from agile.sim2mujoco.utils import quat_rotate_inverse
+from agile.common.motion_data import MotionData
+from agile.sim2mujoco.utils import matrix_from_quat, quat_apply_inverse, quat_inv, quat_mul, quat_rotate_inverse
 
 
 class HistoryBuffer:
@@ -205,6 +206,66 @@ class ObservationTerm:
             return self.obs_dim * self.history_length
 
 
+class MotionTracker:
+    """Thin wrapper around :class:`MotionData` that adds timestep tracking
+    and anchor-body accessors for the sim2mujoco evaluation loop.
+    """
+
+    def __init__(self, config: dict, target_joint_names: list[str], device: torch.device):
+        self.device = device
+        motion_file = config["motion_file"]
+        anchor_body_name = config["anchor_body_name"]
+        motion_body_names = config["motion_body_names"]
+        motion_joint_names = config.get("motion_joint_names")
+
+        print(f"\nLoading motion data from {motion_file}...")
+
+        joint_remap_idx = None
+        if motion_joint_names is not None:
+            joint_remap_idx = MotionData.build_joint_remap_idx(
+                target_joint_names, motion_joint_names, device=str(device)
+            )
+            print(f"  Remapped joints from motion order → policy order ({len(target_joint_names)} joints)")
+        else:
+            print("  No joint remapping (motion order matches policy order)")
+
+        self.data = MotionData(
+            motion_file,
+            joint_remap_idx=joint_remap_idx,
+            device=str(device),
+        )
+
+        self.anchor_body_index = motion_body_names.index(anchor_body_name)
+        self.time_step = 0
+
+        print(f"  Motion frames: {self.data.time_step_total}, FPS: {self.data.fps}")
+        print(f"  Anchor body: {anchor_body_name} (index={self.anchor_body_index})")
+
+    @property
+    def time_step_total(self) -> int:
+        return self.data.time_step_total
+
+    def step(self):
+        """Advance to next timestep (wraps around at end of motion)."""
+        self.time_step = (self.time_step + 1) % self.data.time_step_total
+
+    def get_command(self) -> torch.Tensor:
+        """Current command: ``cat([joint_pos, joint_vel])`` in policy joint order."""
+        return torch.cat([self.data.joint_pos[self.time_step], self.data.joint_vel[self.time_step]], dim=0)
+
+    def get_anchor_pos_w(self) -> torch.Tensor:
+        """Motion anchor position in world frame, shape ``(3,)``."""
+        return self.data._body_pos_w[self.time_step, self.anchor_body_index]
+
+    def get_anchor_quat_w(self) -> torch.Tensor:
+        """Motion anchor quaternion ``[w, x, y, z]``, shape ``(4,)``."""
+        return self.data._body_quat_w[self.time_step, self.anchor_body_index]
+
+    def reset(self):
+        """Reset to beginning of motion."""
+        self.time_step = 0
+
+
 class ObservationProcessor:
     """Flexible observation processor that handles arbitrary observation terms."""
 
@@ -222,6 +283,14 @@ class ObservationProcessor:
         self.joint_names = joint_names
         self.command_manager = command_manager
         self.terms = []
+
+        # Initialize motion tracker if motion_tracking config is present.
+        motion_tracking_cfg = config.get("motion_tracking")
+        if motion_tracking_cfg and "motion_file" in motion_tracking_cfg:
+            target_joint_names = config["articulations"]["robot"]["joint_names"]
+            self.motion_tracker = MotionTracker(motion_tracking_cfg, target_joint_names, device)
+        else:
+            self.motion_tracker = None
 
         # Parse all observation terms from YAML.
         obs_policy = config["observations"]["policy"]
@@ -249,7 +318,7 @@ class ObservationProcessor:
                     f"   Available terms: projected_gravity, base_ang_vel, base_lin_vel, "
                     f"joint_pos_rel, joint_pos, joint_vel, joint_vel_rel, last_action, "
                     f"navigation_command, locomotion_command, velocity_and_height_command, "
-                    f"generated_commands, zero_padding"
+                    f"generated_commands, motion_anchor_pos_b, motion_anchor_ori_b, zero_padding"
                 )
 
             # Validate dimension matches expected shape from YAML (including history)
@@ -322,11 +391,19 @@ class ObservationProcessor:
         elif name == "zero_padding":
             term.compute_raw_fn = lambda sim_state: self._compute_zero_padding(term)
         elif name in ["velocity_and_height_command", "generated_commands"]:
-            term.compute_raw_fn = lambda sim_state: self._compute_velocity_height_command()
+            term.compute_raw_fn = lambda sim_state: self._compute_generated_commands(term)
+        elif name == "motion_anchor_pos_b":
+            term.compute_raw_fn = lambda sim_state: self._compute_motion_anchor_pos_b(sim_state)
+        elif name == "motion_anchor_ori_b":
+            term.compute_raw_fn = lambda sim_state: self._compute_motion_anchor_ori_b(sim_state)
         else:
             return None
 
         return term
+
+    # ------------------------------------------------------------------
+    # Basic observation compute functions
+    # ------------------------------------------------------------------
 
     def _compute_projected_gravity(self, sim_state) -> torch.Tensor:
         """Compute gravity vector in robot frame."""
@@ -395,6 +472,91 @@ class ObservationProcessor:
         """Return zero padding."""
         return torch.zeros(term.obs_dim, device=self.device, dtype=torch.float32)
 
+    # ------------------------------------------------------------------
+    # Motion tracking observation compute functions
+    # ------------------------------------------------------------------
+
+    def _compute_generated_commands(self, term: ObservationTerm) -> torch.Tensor:
+        """Compute generated commands.
+
+        For motion tracking policies: returns cat([target_joint_pos, target_joint_vel])
+        from the motion data (in the policy's joint ordering).
+
+        For velocity/height policies: returns [vx, vy, wz, height] padded to
+        the expected dimension.
+        """
+        if self.motion_tracker is not None:
+            return self.motion_tracker.get_command()
+
+        # Fallback for velocity/height command policies.
+        if self.command_manager is not None:
+            cmd = self.command_manager.get_command()
+        else:
+            cmd = torch.tensor([0.0, 0.0, 0.0, 0.72], device=self.device, dtype=torch.float32)
+
+        # Pad to expected dimension if needed.
+        if cmd.shape[0] < term.obs_dim:
+            padding = torch.zeros(term.obs_dim - cmd.shape[0], device=self.device, dtype=torch.float32)
+            cmd = torch.cat([cmd, padding], dim=0)
+
+        return cmd
+
+    def _compute_motion_anchor_pos_b(self, sim_state) -> torch.Tensor:
+        """Compute motion anchor position in the robot's anchor body frame.
+
+        Mirrors ``motion_anchor_pos_b`` from IsaacLab:
+            pos, _ = subtract_frame_transforms(
+                robot_anchor_pos_w, robot_anchor_quat_w,
+                motion_anchor_pos_w, motion_anchor_quat_w)
+
+        This expresses the motion target position relative to the robot's
+        current anchor body (e.g. torso_link).
+
+        Returns:
+            Tensor of shape (3,).
+        """
+        if self.motion_tracker is None or sim_state.anchor_body_pos is None:
+            return torch.zeros(3, device=self.device, dtype=torch.float32)
+
+        robot_pos = sim_state.anchor_body_pos.float()
+        robot_quat = sim_state.anchor_body_quat.float()
+        motion_pos = self.motion_tracker.get_anchor_pos_w().float()
+
+        # Position of motion anchor relative to robot anchor, in robot anchor frame.
+        # Equivalent to quat_apply(quat_inv(robot_quat), motion_pos - robot_pos).
+        pos_rel = quat_apply_inverse(robot_quat, motion_pos - robot_pos)
+        return pos_rel
+
+    def _compute_motion_anchor_ori_b(self, sim_state) -> torch.Tensor:
+        """Compute motion anchor orientation in the robot's anchor body frame.
+
+        Mirrors ``motion_anchor_ori_b`` from IsaacLab:
+            _, ori = subtract_frame_transforms(
+                robot_anchor_pos_w, robot_anchor_quat_w,
+                motion_anchor_pos_w, motion_anchor_quat_w)
+            mat = matrix_from_quat(ori)
+            return mat[..., :2].reshape(-1)
+
+        Returns first 2 columns of the relative rotation matrix (6 dims).
+
+        Returns:
+            Tensor of shape (6,).
+        """
+        if self.motion_tracker is None or sim_state.anchor_body_quat is None:
+            return torch.zeros(6, device=self.device, dtype=torch.float32)
+
+        robot_quat = sim_state.anchor_body_quat.float()
+        motion_quat = self.motion_tracker.get_anchor_quat_w().float()
+
+        # Orientation of motion anchor relative to robot anchor.
+        quat_rel = quat_mul(quat_inv(robot_quat), motion_quat)
+        mat = matrix_from_quat(quat_rel)  # (3, 3)
+        return mat[:, :2].reshape(-1)  # first 2 columns → (6,)
+
+    # ------------------------------------------------------------------
+    # Main compute / lifecycle
+    # ------------------------------------------------------------------
+
     def compute(self, sim_state) -> torch.Tensor:
         """
         Compute full observation vector.
@@ -408,16 +570,27 @@ class ObservationProcessor:
         obs_list = []
         for term in self.terms:
             obs = term.compute(sim_state)
-            obs_list.append(obs)
+            obs_list.append(obs.flatten())
 
         return torch.cat(obs_list, dim=0)
 
+    def step_motion(self):
+        """Advance the motion tracker by one timestep.
+
+        Call this once per control step, AFTER computing observations
+        and stepping the simulation.
+        """
+        if self.motion_tracker is not None:
+            self.motion_tracker.step()
+
     def set_last_action(self, action: torch.Tensor):
         """Update last action for observation terms that need it."""
-        self.last_action = action
+        self.last_action = action.flatten()
 
     def reset(self):
-        """Reset all history buffers."""
+        """Reset all history buffers and motion tracker."""
         for term in self.terms:
             term.reset()
         self.last_action = None
+        if self.motion_tracker is not None:
+            self.motion_tracker.reset()

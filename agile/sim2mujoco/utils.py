@@ -48,6 +48,10 @@ def quat_rotate_inverse(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     return a - b + c
 
 
+# Alias for compatibility with Isaac Lab naming convention.
+quat_apply_inverse = quat_rotate_inverse
+
+
 def quat_inv(q: torch.Tensor) -> torch.Tensor:
     """
     Compute the inverse (conjugate) of a quaternion.
@@ -59,6 +63,29 @@ def quat_inv(q: torch.Tensor) -> torch.Tensor:
         Inverse quaternion [w, -x, -y, -z], shape (4,)
     """
     return torch.tensor([q[0], -q[1], -q[2], -q[3]], device=q.device, dtype=q.dtype)
+
+
+def quat_mul(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+    """
+    Multiply two quaternions.
+
+    Args:
+        q1: First quaternion [w, x, y, z], shape (4,)
+        q2: Second quaternion [w, x, y, z], shape (4,)
+
+    Returns:
+        Product quaternion [w, x, y, z], shape (4,)
+    """
+    w1, x1, y1, z1 = q1[0], q1[1], q1[2], q1[3]
+    w2, x2, y2, z2 = q2[0], q2[1], q2[2], q2[3]
+    return torch.stack(
+        [
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ]
+    )
 
 
 def quat_apply(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -81,6 +108,26 @@ def quat_apply(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     # Cross-product formula: v' = v + 2*w*(q_vec × v) + 2*(q_vec × (q_vec × v))
     t = torch.cross(q_vec, v, dim=0) * 2.0
     return v + q_w * t + torch.cross(q_vec, t, dim=0)
+
+
+def matrix_from_quat(q: torch.Tensor) -> torch.Tensor:
+    """
+    Convert a quaternion to a 3x3 rotation matrix.
+
+    Args:
+        q: Quaternion [w, x, y, z], shape (4,)
+
+    Returns:
+        Rotation matrix, shape (3, 3)
+    """
+    w, x, y, z = q[0], q[1], q[2], q[3]
+    return torch.stack(
+        [
+            torch.stack([1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - w * z), 2.0 * (x * z + w * y)]),
+            torch.stack([2.0 * (x * y + w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - w * x)]),
+            torch.stack([2.0 * (x * z - w * y), 2.0 * (y * z + w * x), 1.0 - 2.0 * (x * x + y * y)]),
+        ]
+    )
 
 
 def load_config(yaml_path: Path) -> dict:
