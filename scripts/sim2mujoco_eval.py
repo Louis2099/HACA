@@ -13,15 +13,43 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Main entry point for sim2mujoco evaluation."""
+"""Main entry point for sim2mujoco evaluation.
+
+Examples:
+    # Without eval config (manual keyboard control):
+    python scripts/sim2mujoco_eval.py \
+        --checkpoint agile/data/policy/velocity_height_g1/unitree_g1_velocity_height_recurrent_student.pt \
+        --config agile/data/policy/velocity_height_g1/unitree_g1_velocity_height_recurrent_student.yaml \
+        --mjcf agile/rl_env/assets/robot_menagerie/unitree/g1/mujoco/scene_29dof.xml \
+        --duration 100.0
+
+    # Motion tracking task (uses training checkpoint directly, no JIT export needed):
+    python scripts/sim2mujoco_eval.py \
+        --checkpoint agile/data/policy/tracking_flat_g1/tracking_flat_g1.pt \
+        --config agile/data/policy/tracking_flat_g1/tracking_flat_g1.yaml \
+        --mjcf agile/rl_env/assets/robot_menagerie/unitree/g1/mujoco/scene_29dof.xml \
+        --duration 100.0
+
+    # With eval config (deterministic command schedule, duration from eval config):
+    python scripts/sim2mujoco_eval.py \
+        --checkpoint agile/data/policy/velocity_height_g1/unitree_g1_velocity_height_recurrent_student.pt \
+        --config agile/data/policy/velocity_height_g1/unitree_g1_velocity_height_recurrent_student.yaml \
+        --mjcf agile/rl_env/assets/robot_menagerie/unitree/g1/mujoco/scene_29dof.xml \
+        --eval-config agile/sim2mujoco/configs/x_velocity_sweep.yaml \
+        --save-data --no-viewer
+"""
 
 import argparse
+import signal
+import time
+from datetime import datetime
 from pathlib import Path
 
 import torch
 
 from agile.sim2mujoco.actions import ActionProcessor
 from agile.sim2mujoco.commands import CommandManager
+from agile.sim2mujoco.data_logger import Sim2MuJoCoDataLogger, get_command_info
 from agile.sim2mujoco.observations import ObservationProcessor
 from agile.sim2mujoco.policy import PolicyWrapper
 from agile.sim2mujoco.simulation import MuJocoSimulation
@@ -45,6 +73,14 @@ def main():
         "--disable-keyboard", action="store_true", help="Disable keyboard control for interactive commands"
     )
     parser.add_argument("--verbose", action="store_true", help="Enable step-by-step logging output")
+    parser.add_argument(
+        "--no-real-time", action="store_true", help="Disable real-time pacing (runs as fast as possible)"
+    )
+    parser.add_argument(
+        "--eval-config", type=Path, default=None, help="Path to eval config YAML (deterministic command schedule)"
+    )
+    parser.add_argument("--save-data", action="store_true", help="Save evaluation data to disk")
+    parser.add_argument("--output-dir", type=Path, default=None, help="Output directory for saved data")
 
     args = parser.parse_args()
 
@@ -71,15 +107,64 @@ def main():
         robot_config["default_joint_stiffness"] = [kp * args.pd_scale for kp in robot_config["default_joint_stiffness"]]
         robot_config["default_joint_damping"] = [kd * args.pd_scale for kd in robot_config["default_joint_damping"]]
 
-    # Create command manager if keyboard control is enabled.
+    # Detect command terms from config (needed for obs and logging).
+    _, _, command_dim, _ = get_command_info(config)
+
+    # Load eval config if provided (YAML-defined command schedule).
+    eval_config = None
+    if args.eval_config is not None:
+        if not args.eval_config.exists():
+            raise FileNotFoundError(f"Eval config not found: {args.eval_config}")
+        from agile.algorithms.evaluation.eval_config import EvalConfig
+
+        eval_config = EvalConfig.from_yaml(args.eval_config)
+        if eval_config.num_envs != 1:
+            raise ValueError(
+                f"sim2mujoco only supports num_envs=1, got num_envs={eval_config.num_envs} "
+                f"in eval config {args.eval_config}"
+            )
+        if eval_config.num_episodes != 1:
+            raise ValueError(
+                f"sim2mujoco only supports num_episodes=1, got num_episodes={eval_config.num_episodes} "
+                f"in eval config {args.eval_config}"
+            )
+        if eval_config.get_env_config(0) is None:
+            raise ValueError(
+                "Eval config must have an environment with env_ids: [0] for sim2mujoco. "
+                f"Found env_ids: {[e.env_ids for e in eval_config.environments]}"
+            )
+        args.duration = eval_config.episode_length_s
+        print(f"\n✓ Loaded eval config from {args.eval_config} (duration={args.duration}s)")
+
+    # Create command manager when policy has command terms (for obs and logging).
+    # Keyboard control only active when viewer is enabled and keyboard not disabled.
+    # When eval_config is used, scheduler overrides commands so keyboard is effectively disabled.
     command_manager = None
-    if not args.disable_keyboard and not args.no_viewer:
+    if command_dim > 0:
         command_manager = CommandManager(
             device=device, defaults={"linear_x": 0.0, "linear_y": 0.0, "angular_z": 0.0, "height": 0.72}
         )
-        print("\n✓ Keyboard control enabled")
+        if eval_config is not None:
+            print("\n✓ Eval config active (command schedule from YAML)")
+        elif not args.disable_keyboard and not args.no_viewer:
+            print("\n✓ Keyboard control enabled")
+        else:
+            print("\n✓ Keyboard control disabled (command manager active for default commands)")
     else:
-        print("\n✓ Keyboard control disabled")
+        print("\n✓ No command terms in policy")
+
+    # Create command scheduler when eval config is used.
+    command_scheduler = None
+    if eval_config is not None and command_manager is not None:
+        from agile.sim2mujoco.command_scheduler import Sim2MuJoCoCommandScheduler
+
+        command_scheduler = Sim2MuJoCoCommandScheduler(
+            eval_config=eval_config,
+            command_manager=command_manager,
+            duration=args.duration,
+            command_dim=command_dim,
+            verbose=args.verbose,
+        )
 
     # Load policy.
     print(f"\nLoading policy from {args.checkpoint}...")
@@ -118,18 +203,77 @@ def main():
     obs_processor.reset()
     policy.reset()
 
-    # Evaluation loop.
+    # Setup data logger.
+    data_logger = None
+    if args.save_data:
+        if args.output_dir is not None:
+            output_dir = args.output_dir
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            if eval_config is not None:
+                task_name = eval_config.task_name
+                eval_stem = args.eval_config.stem
+                output_dir = Path("logs/sim2mujoco") / task_name / f"{eval_stem}_{timestamp}"
+            else:
+                output_dir = Path("logs/sim2mujoco") / f"{args.config.stem}_{timestamp}"
+
+        provenance = {
+            "checkpoint": str(args.checkpoint),
+            "config": str(args.config),
+            "eval_config": str(args.eval_config) if args.eval_config else None,
+        }
+        data_logger = Sim2MuJoCoDataLogger(output_dir, config, sim.joint_names, sim.dt, provenance=provenance)
+
+    # Evaluation loop parameters.
     control_dt = sim.dt  # This is physics_dt * decimation
     physics_dt = sim.physics_dt
     num_steps = int(args.duration / control_dt)
 
+    # Real-time pacing: sync viewer at 30 Hz and sleep to match wall-clock time.
+    real_time = not args.no_real_time
+    render_dt = 1.0 / 30.0 if real_time else 0.0
+
     print(f"\nRunning evaluation for {args.duration}s ({num_steps} control steps)...")
     print(f"  Control frequency: {1.0 / control_dt:.1f} Hz")
     print(f"  Physics frequency: {1.0 / physics_dt:.1f} Hz")
+    if real_time:
+        print("  Viewer sync: 30 Hz (real-time pacing)")
+    else:
+        print(f"  Viewer sync: {1.0 / control_dt:.1f} Hz (no pacing)")
     print("-" * 80)
 
+    total_steps = 0
+    interrupted = False
+
+    def _raise_keyboard_interrupt(*_args):
+        """Convert SIGTERM to KeyboardInterrupt so finally block runs and data is saved."""
+        raise KeyboardInterrupt
+
+    if args.save_data and hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
+
     try:
+        wall_start = time.time()
+        last_render = wall_start
+
         for step in range(num_steps):
+            # Wait while paused (viewer stays responsive).
+            was_paused = False
+            while sim.paused and not sim.step_once:
+                was_paused = True
+                time.sleep(0.01)
+                if not sim.viewer.is_running():
+                    raise KeyboardInterrupt
+            # Reset wall clock reference after unpausing to avoid a burst of catch-up steps.
+            if was_paused or sim.step_once:
+                wall_start = time.time() - step * control_dt
+                last_render = time.time()
+            sim.step_once = False
+
+            # Apply scheduled commands (before obs so policy sees updated commands).
+            if command_scheduler is not None:
+                command_scheduler.update(control_dt)
+
             # Get observations.
             sim_state = sim.get_state()
             obs = obs_processor.compute(sim_state)
@@ -148,23 +292,52 @@ def main():
             for _ in range(sim.decimation):
                 sim.step(joint_cmd)
 
+            # Sync viewer at target frame rate.
+            now = time.time()
+            if now - last_render >= render_dt:
+                sim.viewer.sync()
+                last_render = now
+
+            # Advance motion tracker for next step.
+            obs_processor.step_motion()
+
+            # Real-time pacing: sleep to match simulation time to wall-clock time.
+            if real_time:
+                target_wall = wall_start + (step + 1) * control_dt
+                sleep_time = target_wall - time.time()
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
+            # Record data for saving (get fresh state AFTER simulation steps).
+            if data_logger is not None:
+                post_state = sim.get_state()
+                commands = command_manager.get_command() if command_manager is not None else None
+                data_logger.record_step(post_state, joint_cmd, actions, commands=commands)
+
             # Logging (get fresh state AFTER simulation steps).
-            if args.verbose and step % args.log_freq == 0:
-                current_state = sim.get_state()
+            if args.verbose and total_steps % args.log_freq == 0:
+                current_state = post_state if data_logger is not None else sim.get_state()
                 print(
-                    f"Step {step:4d}/{num_steps} | "
+                    f"Step {total_steps:4d} | "
                     f"Root pos: [{current_state.root_pos[0]:6.3f}, {current_state.root_pos[1]:6.3f}, {current_state.root_pos[2]:6.3f}] | "
                     f"Root vel: [{current_state.root_lin_vel[0]:6.3f}, {current_state.root_lin_vel[1]:6.3f}, {current_state.root_lin_vel[2]:6.3f}] | "
                     f"Action mean: {actions.mean().item():7.4f}, std: {actions.std().item():7.4f}"
                 )
 
+            total_steps += 1
+
         print("-" * 80)
-        print(f"\nEvaluation complete! Ran {num_steps} steps.")
+        print(f"\nEvaluation complete! Ran {total_steps} steps.")
 
     except KeyboardInterrupt:
-        print("\n\nInterrupted by user.")
+        interrupted = True
+        print("\n\nInterrupted by user (Ctrl+C).")
 
     finally:
+        if data_logger is not None and data_logger.has_data:
+            if interrupted:
+                print("Saving buffered data before exit...")
+            data_logger.save_episode(0)
         sim.close()
         print("Simulation closed.")
 
