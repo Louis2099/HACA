@@ -23,13 +23,6 @@ Examples:
         --mjcf agile/rl_env/assets/robot_menagerie/unitree/g1/mujoco/scene_29dof.xml \
         --duration 100.0
 
-    # Motion tracking task (uses training checkpoint directly, no JIT export needed):
-    python scripts/sim2mujoco_eval.py \
-        --checkpoint agile/data/policy/tracking_flat_g1/tracking_flat_g1.pt \
-        --config agile/data/policy/tracking_flat_g1/tracking_flat_g1.yaml \
-        --mjcf agile/rl_env/assets/robot_menagerie/unitree/g1/mujoco/scene_29dof.xml \
-        --duration 100.0
-
     # With eval config (deterministic command schedule, duration from eval config):
     python scripts/sim2mujoco_eval.py \
         --checkpoint agile/data/policy/velocity_height_g1/unitree_g1_velocity_height_recurrent_student.pt \

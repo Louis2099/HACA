@@ -181,9 +181,7 @@ class TestSim2MuJoCo(unittest.TestCase):
         """Helper to run the evaluation script."""
         # Skip if checkpoint doesn't exist
         if not os.path.exists(ckpt):
-            print(f"\n⚠️ Skipping {name}: Checkpoint not found at {ckpt}")
-            # We don't fail here to allow running tests even without all checkpoints locally
-            return
+            self.skipTest(f"Checkpoint not found at {ckpt}")
 
         if not os.path.exists(mjcf):
             print(f"❌ MJCF file not found at {mjcf}")

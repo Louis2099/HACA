@@ -10,8 +10,8 @@ workflow:
   name: '{{workflow_name}}'
   resources:
     default:
-      cpu: 6
-      gpu: 1
+      cpu: 16
+      gpu: 2
       memory: '{{memory}}'
       storage: '{{storage}}'
   tasks:
@@ -67,7 +67,9 @@ workflow:
             CMD+="--log_project_name {{project_name}} "
             CMD+="--run_name {{run_name}} "
             CMD+="--max_iterations {{max_iterations}} "
-            CMD+="--video --video_interval_iter 200 "
+            {% if video == true or video == "true" %}
+            CMD+="--video --video_length {{video_length}} --video_interval_iter {{video_interval_iter}} "
+            {% endif %}
             # Only add seed parameter if it is defined
             {% if seed is defined %}
             CMD+="--seed {{seed}} "
@@ -109,5 +111,8 @@ default-values:
   max_iterations: 20000
   memory: 200Gi
   storage: 200Gi
+  video: true
+  video_length: 200
+  video_interval_iter: 200
 timeout:
   exec_timeout: 7d
