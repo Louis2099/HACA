@@ -17,8 +17,10 @@ __pycache__/
 *.so
 .mypy_cache/
 .pytest_cache/
+.ruff_cache/
 build/
 dist/
 *.egg-info/
 .vscode/
 .idea/
+.cursor/

@@ -160,7 +160,10 @@ def main(
 
     # save resume path before creating a new log_dir
     if agent_cfg.resume:
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+        if os.path.isfile(agent_cfg.load_checkpoint):
+            resume_path = os.path.abspath(agent_cfg.load_checkpoint)
+        else:
+            resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
     # wrap for video recording
     if args_cli.video:

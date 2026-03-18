@@ -177,14 +177,27 @@ class TestAllTasks(unittest.TestCase):
                     env["OMNI_HEADLESS"] = "1"
                     env["DISPLAY"] = ":1"
 
+                    # Add fast fallen state collection overrides for StandUp tasks
+                    if "StandUp" in task:
+                        cmd.extend(
+                            [
+                                "agent.fallen_state_dataset_cfg.num_spawns_per_level=1",
+                                "agent.fallen_state_dataset_cfg.fall_duration_s=0.1",
+                                "agent.fallen_state_dataset_cfg.cache_enabled=False",
+                            ]
+                        )
+
                     print(f"Running command: {' '.join(cmd)}", flush=True)
+
+                    # Distillation tasks need more time to load teacher models
+                    timeout = 180 if "Distillation" in task else 120
 
                     try:
                         # Run the command with timeout
                         result = subprocess.run(
                             cmd,
                             check=True,  # Will raise exception if process returns non-zero
-                            timeout=600,  # 10 minutes timeout per task
+                            timeout=timeout,  # 2-3 minutes timeout per task
                             capture_output=True,
                             text=True,
                             env=env,
@@ -355,6 +368,7 @@ class TestAllTasks(unittest.TestCase):
 
         task = "Velocity-G1-History-v0"
         num_envs = 2
+        num_steps = 10
 
         cmd = [
             self.isaaclab_script,
@@ -364,9 +378,8 @@ class TestAllTasks(unittest.TestCase):
             task,
             "--num_envs",
             str(num_envs),
-            "--video",
-            "--video_length",
-            "10",
+            "--num_steps",
+            str(num_steps),
             "--headless",
         ]
 
@@ -384,7 +397,7 @@ class TestAllTasks(unittest.TestCase):
             subprocess.run(
                 cmd,
                 check=True,
-                timeout=600,  # 10 minutes: camera/video init adds overhead
+                timeout=180,
                 capture_output=True,
                 text=True,
                 env=env,

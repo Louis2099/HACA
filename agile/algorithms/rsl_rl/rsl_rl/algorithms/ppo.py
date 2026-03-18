@@ -503,7 +503,7 @@ class PPO:
             if self.use_l2c2 and l2c2_batch is not None:
                 prev_obs_batch, next_obs_batch, prev_priv_obs_batch, next_priv_obs_batch, done_mask_batch = l2c2_batch
 
-                interpolation_factor = torch.rand(prev_obs_batch.shape[0], device=self.device)
+                interpolation_factor = torch.rand(prev_obs_batch.shape[0], 1, device=self.device)
                 interpolated_obs = prev_obs_batch + interpolation_factor * (next_obs_batch - prev_obs_batch)
                 interpolated_priv_obs = prev_priv_obs_batch + interpolation_factor * (next_priv_obs_batch - prev_priv_obs_batch)
                 

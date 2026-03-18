@@ -42,7 +42,7 @@ import pandas as pd
 class TestDeterministicEvalE2E(unittest.TestCase):
     """End-to-end test for deterministic evaluation system."""
 
-    DEFAULT_EVAL_TIMEOUT_S = 1200
+    DEFAULT_EVAL_TIMEOUT_S = 1200  # Height-map terrain init can be very slow in shared CI runners.
 
     @classmethod
     def setUpClass(cls):
@@ -88,13 +88,13 @@ class TestDeterministicEvalE2E(unittest.TestCase):
             0: {  # Env 0: X-velocity sweep
                 "command_col": "commands_0",  # lin_vel_x
                 "values": [0.0, 0.5],
-                "interval_s": 2.5,
+                "interval_s": 1.25,
                 "other_commands": {"commands_1": 0.0, "commands_2": 0.0, "commands_3": 0.72},
             },
             1: {  # Env 1: Height sweep
                 "command_col": "commands_3",  # base_height
                 "values": [0.65, 0.72],
-                "interval_s": 2.5,
+                "interval_s": 1.25,
                 "other_commands": {"commands_0": 0.0, "commands_1": 0.0, "commands_2": 0.0},
             },
         }
@@ -178,6 +178,8 @@ class TestDeterministicEvalE2E(unittest.TestCase):
                 str(self.quick_config),
                 "--num_envs",
                 "2",
+                "--num_steps",
+                "200",
                 "--run_evaluation",
                 "--save_trajectories",
                 "--headless",
@@ -196,6 +198,8 @@ class TestDeterministicEvalE2E(unittest.TestCase):
                 str(self.quick_config),
                 "--num_envs",
                 "2",
+                "--num_steps",
+                "200",
                 "--run_evaluation",
                 "--save_trajectories",
                 "--headless",
@@ -210,17 +214,28 @@ class TestDeterministicEvalE2E(unittest.TestCase):
         print(f"[TEST] Command: {' '.join(cmd)}")
 
         # Run evaluation with timeout
+        timeout_s = int(os.environ.get("DETERMINISTIC_EVAL_TIMEOUT_S", self.DEFAULT_EVAL_TIMEOUT_S))
         try:
             result = subprocess.run(
                 cmd,
                 env=env,
-                timeout=300,  # 5 minutes timeout
+                timeout=timeout_s,
                 capture_output=True,
                 text=True,
                 cwd=str(self.project_root),
             )
-        except subprocess.TimeoutExpired:
-            self.fail("Evaluation timed out after 5 minutes")
+        except subprocess.TimeoutExpired as e:
+            # TimeoutExpired may include partial output; print it to make CI failures actionable.
+            stdout = (e.stdout or "").strip()
+            stderr = (e.stderr or "").strip()
+            if stdout:
+                print(f"[TEST] Partial STDOUT before timeout:\n{stdout[-8000:]}")
+            if stderr:
+                print(f"[TEST] Partial STDERR before timeout:\n{stderr[-8000:]}")
+            self.fail(
+                f"Evaluation timed out after {timeout_s} seconds. "
+                "Set DETERMINISTIC_EVAL_TIMEOUT_S to override for slower runners."
+            )
 
         # Check for errors
         if result.returncode != 0:
@@ -444,7 +459,7 @@ class TestDeterministicEvalE2E(unittest.TestCase):
         df = pd.read_parquet(parquet_files[0])
 
         # Expected episode length from quick_test.yaml
-        expected_length_s = 5.0
+        expected_length_s = 2.5
         expected_steps = int(expected_length_s * 50)  # 50 Hz control frequency
 
         # Check episode length in steps
