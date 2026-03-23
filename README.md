@@ -112,11 +112,13 @@ We would like to acknowledge the following projects from which parts of the code
 If you use AGILE in your research, please cite:
 
 ```bibtex
-@misc{agile2025,
-  title        = {AGILE: A Generic Isaac-Lab based Engine for Humanoid Loco-Manipulation Learning},
-  author       = {Zhao, Huihua and Cathomen, Rafael and Gulich, Lionel and Ongan, Efe Arda and Lin, Michael and Jain, Shalin and Liu, Wei and Kulkarni, Vishal and Pouya, Soha and Chang, Yan},
-  year         = {2025},
-  note         = {Version compatible with Isaac Lab 2.3; accessed 2025-11-19},
-  url          = {https://github.com/nvidia-isaac/WBC-AGILE/tree/main}
+@misc{zhao2026agilecomprehensiveworkflowhumanoid,
+      title={AGILE: A Comprehensive Workflow for Humanoid Loco-Manipulation Learning},
+      author={Huihua Zhao* and Rafael Cathomen* and Lionel Gulich and Wei Liu and Efe Arda Ongan and Michael Lin and Shalin Jain and Soha Pouya and Yan Chang},
+      year={2026},
+      eprint={2603.20147},
+      archivePrefix={arXiv},
+      primaryClass={cs.RO},
+      url={https://arxiv.org/abs/2603.20147},
 }
 ```
