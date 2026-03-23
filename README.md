@@ -4,6 +4,7 @@
 
 **AGILE** provides a comprehensive reinforcement learning framework for training whole-body control policies with validated sim-to-real transfer capabilities. Built on NVIDIA Isaac Lab, this toolkit enables researchers and practitioners to develop loco-manipulation behaviors for humanoid robots.
 
+**[Paper](https://arxiv.org/abs/2603.20147)**
 **[Documentation](https://nvidia-isaac.github.io/WBC-AGILE/)**
 
 <table align="center">
