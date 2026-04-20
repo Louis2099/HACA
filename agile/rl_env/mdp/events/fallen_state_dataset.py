@@ -17,11 +17,10 @@
 
 from __future__ import annotations
 
-import logging
 import math
 import os
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
@@ -29,8 +28,6 @@ import isaaclab.utils.math as math_utils
 from isaaclab.assets import Articulation
 from isaaclab.terrains import TerrainImporter
 from isaaclab.utils import configclass
-
-logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -47,14 +44,56 @@ class FallenStateDatasetCfg:
     Each spawn distributes envs uniformly across all terrain types within the level.
     """
 
-    fall_duration_s: float = 2.5
+    fall_duration_s: float = 1.0
     """Duration to simulate falling with disabled joints (long enough for zero velocity)."""
+
+    spawn_height_offset: float = 2.0
+    """Extra height (meters) above default spawn height when dropping robots."""
+
+    spawn_xy_range: float = 3.0
+    """Random xy offset (meters) when spawning. Sampled uniformly from [-range, range] per axis."""
+
+    initial_lin_vel_range: float = 1.0
+    """Maximum linear velocity (m/s) per axis when spawning. Sampled uniformly from [-range, range]."""
+
+    initial_ang_vel_range: float = 1.0
+    """Maximum angular velocity (rad/s) per axis when spawning. Sampled uniformly from [-range, range]."""
+
+    spawn_orientation: Literal["random", "on_back"] = "random"
+    """How to orient robots when spawning for collection.
+
+    'random': Uniform random over SO(3) (default, for general fallen states).
+    'on_back': Lying on back with random yaw (for back-to-standing tasks).
+    """
+
+    spawn_pitch_range: tuple[float, float] = (-1.7, -1.4)
+    """Pitch range in radians for 'on_back' orientation mode. Default centered around -pi/2."""
+
+    spawn_joint_mode: Literal["random", "default"] = "random"
+    """How to initialize joints when spawning.
+
+    'random': Random within soft joint limits (default).
+    'default': Default joint positions with zero velocity.
+    """
 
     cache_enabled: bool = True
     """Whether to enable disk caching of collected states."""
 
     cache_dir: str = "fallen_states_cache"
     """Directory to store cached fallen states."""
+
+    # Stability thresholds to detect and reset exploding robots
+    max_height_above_spawn: float = 1.0
+    """Maximum height above spawn origin before robot is considered unstable (m)."""
+
+    max_lin_vel: float = 20.0
+    """Maximum linear velocity magnitude before robot is considered unstable (m/s)."""
+
+    max_ang_vel: float = 50.0
+    """Maximum angular velocity magnitude before robot is considered unstable (rad/s)."""
+
+    max_joint_vel: float = 100.0
+    """Maximum joint velocity magnitude before robot is considered unstable (rad/s)."""
 
 
 @dataclass
@@ -90,6 +129,7 @@ class FallenStateDataset:
     _num_joints: int = 0
     _device: str = "cpu"
     _terrain_cell_size: tuple[float, float] = (8.0, 8.0)  # Default, will be updated from terrain config
+    _is_flat_terrain: bool = False
 
     def __post_init__(self) -> None:
         self._states_by_level = {}
@@ -117,6 +157,8 @@ class FallenStateDataset:
         simulates falling for fall_duration_s, then captures the final resting state.
         This is repeated num_spawns_per_level times per level.
 
+        For flat terrain (no terrain_generator), uses a single level with no xy offset.
+
         Args:
             env: The environment to collect states from.
             verbose: Whether to print progress information.
@@ -127,24 +169,34 @@ class FallenStateDataset:
 
         self._device = "cpu"  # Store on CPU to save VRAM
         self._num_joints = robot.num_joints
-        self._num_terrain_levels = terrain.cfg.terrain_generator.num_rows
-        self._terrain_cell_size = terrain.cfg.terrain_generator.size
+
+        # Check if using generated terrain or flat plane
+        self._is_flat_terrain = terrain.cfg.terrain_generator is None
+        if self._is_flat_terrain:
+            self._num_terrain_levels = 1
+            self._terrain_cell_size = (100.0, 100.0)  # Large size, won't clamp much
+        else:
+            self._num_terrain_levels = terrain.cfg.terrain_generator.num_rows
+            self._terrain_cell_size = terrain.cfg.terrain_generator.size
 
         # Calculate collection parameters
         dt = env.step_dt
         fall_steps = int(self.cfg.fall_duration_s / dt)
-        num_terrain_types = terrain.terrain_origins.shape[1]
+        num_terrain_types = 1 if self._is_flat_terrain else terrain.terrain_origins.shape[1]
         states_per_level = env.num_envs * self.cfg.num_spawns_per_level
         total_states = states_per_level * self._num_terrain_levels
 
         if verbose:
-            logger.info("[FallenStateDataset] Starting collection:")
-            logger.info(f"  - Terrain grid: {self._num_terrain_levels} levels x {num_terrain_types} types")
-            logger.info(f"  - Num envs: {env.num_envs}")
-            logger.info(f"  - Spawns per level: {self.cfg.num_spawns_per_level}")
-            logger.info(f"  - States per level: {states_per_level}")
-            logger.info(f"  - Total states: {total_states}")
-            logger.info(f"  - Fall duration: {self.cfg.fall_duration_s}s ({fall_steps} steps)")
+            print("[FallenStateDataset] Starting collection:")
+            if self._is_flat_terrain:
+                print("  - Terrain: flat plane (single level)")
+            else:
+                print(f"  - Terrain grid: {self._num_terrain_levels} levels x {num_terrain_types} types")
+            print(f"  - Num envs: {env.num_envs}")
+            print(f"  - Spawns per level: {self.cfg.num_spawns_per_level}")
+            print(f"  - States per level: {states_per_level}")
+            print(f"  - Total states: {total_states}")
+            print(f"  - Fall duration: {self.cfg.fall_duration_s}s ({fall_steps} steps)")
 
         # Initialize storage for all terrain levels
         for level in range(self._num_terrain_levels):
@@ -159,22 +211,50 @@ class FallenStateDataset:
             }
 
         # Disable terminations during collection to allow full falls without interruption
-        # Requires the monkey patch in manager_based_rl_env_patch.py to be active
         env._disable_terminations = True
+
+        # Pre-allocate env ids for joint disabling
+        all_env_ids = torch.arange(env.num_envs, device=env.device)
+        decimation = env.cfg.decimation
+
         try:
             # Collect states for each terrain level
             for level in range(self._num_terrain_levels):
                 if verbose:
-                    logger.info(f"  Collecting level {level + 1}/{self._num_terrain_levels}...")
+                    print(f"  Level {level + 1}/{self._num_terrain_levels}", flush=True)
 
-                for _spawn_idx in range(self.cfg.num_spawns_per_level):
+                level_reset_count = 0
+                for spawn_idx in range(self.cfg.num_spawns_per_level):
                     # Reset envs distributed across terrain columns
                     # With num_envs >> num_cols, all terrain types are covered via modulo wrap-around
                     self._reset_envs_to_terrain_cells(env, level)
 
-                    # Simulate falling for full duration
+                    # Simulate falling for full duration with joints disabled (zero torques)
+                    # We use a manual sim loop to ensure efforts are zeroed before each physics step
                     for _step in range(fall_steps):
-                        env.step(torch.zeros(env.num_envs, env.action_manager.total_action_dim, device=env.device))
+                        if verbose:
+                            progress = f"    Spawn {spawn_idx + 1}/{self.cfg.num_spawns_per_level}, step {_step + 1}/{fall_steps}"
+                            print(f"{progress:<50}", end="\r", flush=True)
+
+                        # Step simulation with disabled joints
+                        for _ in range(decimation):
+                            # Zero out joint efforts before physics (same as disable_joints event)
+                            robot._joint_effort_target_sim[:] = 0.0
+                            robot.root_physx_view.set_dof_actuation_forces(robot._joint_effort_target_sim, all_env_ids)
+                            # Step physics with rendering enabled
+                            env.sim.step()
+
+                        # Update scene after decimation steps
+                        env.scene.update(dt=env.step_dt)
+
+                        # Check for unstable robots and reset them
+                        # They continue falling with remaining steps (no counter restart)
+                        unstable = self._check_unstable_envs(env)
+                        if unstable.any():
+                            reset_ids = torch.where(unstable)[0]
+                            for env_id in reset_ids:
+                                self._reset_single_env(env, env_id.item(), level)
+                            level_reset_count += unstable.sum().item()
 
                     # Capture final resting state (only once at the end)
                     self._capture_states(env, level, terrain)
@@ -183,17 +263,24 @@ class FallenStateDataset:
                 self._finalize_level(level)
 
                 if verbose:
+                    # Clear progress line and print level summary
                     actual = self.get_num_states(level)
-                    logger.info(f"  Level {level + 1} done ({actual} states)")
+                    reset_info = f", {level_reset_count} resets" if level_reset_count > 0 else ""
+                    print(f"    Done: {actual} states{reset_info:<30}")
 
             if verbose:
                 total_states = sum(self.get_num_states(lvl) for lvl in range(self._num_terrain_levels))
-                logger.info(f"[FallenStateDataset] Collection complete: {total_states} total states")
+                print(f"[FallenStateDataset] Collection complete: {total_states} total states")
         finally:
             # Re-enable terminations for normal training
             env._disable_terminations = False
             # Reset terrain levels to 0 (easiest) so training starts from curriculum beginning
-            terrain.terrain_levels[:] = 0
+            # Only for generated terrain - plane terrain doesn't have terrain_levels
+            if not self._is_flat_terrain:
+                terrain.terrain_levels[:] = 0
+            # Re-enable rendering by doing a render step
+            if env.sim.has_gui():
+                env.sim.render()
 
     def _reset_envs_to_terrain_cells(self, env: ManagerBasedRLEnv, level: int) -> None:
         """Reset environments to specific terrain cells with random initial poses.
@@ -206,51 +293,213 @@ class FallenStateDataset:
         robot: Articulation = env.scene["robot"]
         num_envs = env.num_envs
 
-        # terrain_origins has shape (num_levels, num_cols, 3)
-        terrain_origins = terrain.terrain_origins  # (num_levels, num_cols, 3)
-        num_cols = terrain_origins.shape[1]
+        if self._is_flat_terrain:
+            # Flat terrain: use existing env_origins (set by scene), no xy offset
+            # Note: plane terrain doesn't have terrain_levels/terrain_types attributes
+            env_origins = env.scene.env_origins.clone()
+        else:
+            # Generated terrain: distribute across terrain cells
+            terrain_origins = terrain.terrain_origins  # (num_levels, num_cols, 3)
+            num_cols = terrain_origins.shape[1]
 
-        # Update terrain tracking tensors
-        # Envs are distributed across columns via modulo - with num_envs >> num_cols,
-        # all terrain types are covered multiple times per spawn
-        terrain.terrain_levels[:] = level
-        terrain.terrain_types[:] = torch.arange(num_envs, device=env.device) % num_cols
+            # Update terrain tracking tensors
+            terrain.terrain_levels[:] = level
+            terrain.terrain_types[:] = torch.arange(num_envs, device=env.device) % num_cols
 
-        # Get env origins directly from terrain_origins using level and type indices
-        env_origins = terrain_origins[level, terrain.terrain_types.long()]  # (num_envs, 3)
-        env.scene.env_origins[:] = env_origins
+            # Get env origins directly from terrain_origins
+            env_origins = terrain_origins[level, terrain.terrain_types.long()]  # (num_envs, 3)
+            env.scene.env_origins[:] = env_origins
 
-        # Sample random initial poses for falling
+        # Sample initial poses for falling
         root_states = robot.data.default_root_state.clone()
         env_ids = torch.arange(num_envs, device=env.device)
 
-        # Random yaw, roll, pitch
-        yaw = torch.rand(num_envs, device=env.device) * 2 * math.pi - math.pi
-        roll = (torch.rand(num_envs, device=env.device) * 2 - 1) * math.radians(20)
-        pitch = (torch.rand(num_envs, device=env.device) * 2 - 1) * math.radians(20)
-        quat_delta = math_utils.quat_from_euler_xyz(roll, pitch, yaw)
-        root_states[:, 3:7] = math_utils.quat_mul(root_states[:, 3:7], quat_delta)
+        # Set orientation based on spawn mode
+        if self.cfg.spawn_orientation == "on_back":
+            # Lying on back: backward pitch + random yaw
+            pitch = torch.empty(num_envs, device=env.device).uniform_(*self.cfg.spawn_pitch_range)
+            yaw = torch.rand(num_envs, device=env.device) * 2 * math.pi - math.pi
+            roll = torch.zeros(num_envs, device=env.device)
+            quat_delta = math_utils.quat_from_euler_xyz(roll, pitch, yaw)
+            root_states[:, 3:7] = math_utils.quat_mul(root_states[:, 3:7], quat_delta)
+        else:
+            # Uniform random orientation over SO(3) using Shoemake's algorithm
+            u1 = torch.rand(num_envs, device=env.device)
+            u2 = torch.rand(num_envs, device=env.device)
+            u3 = torch.rand(num_envs, device=env.device)
+            sqrt_u1 = torch.sqrt(u1)
+            sqrt_1_minus_u1 = torch.sqrt(1.0 - u1)
+            two_pi_u2 = 2.0 * math.pi * u2
+            two_pi_u3 = 2.0 * math.pi * u3
+            random_quat = torch.stack(
+                [
+                    sqrt_1_minus_u1 * torch.sin(two_pi_u2),
+                    sqrt_1_minus_u1 * torch.cos(two_pi_u2),
+                    sqrt_u1 * torch.sin(two_pi_u3),
+                    sqrt_u1 * torch.cos(two_pi_u3),
+                ],
+                dim=-1,
+            )
+            root_states[:, 3:7] = random_quat
 
-        # Add random linear and angular velocity
-        root_states[:, 7:10] = (torch.rand(num_envs, 3, device=env.device) * 2 - 1) * 5.0  # lin vel
-        root_states[:, 10:13] = (torch.rand(num_envs, 3, device=env.device) * 2 - 1) * 5.0  # ang vel
+        # Add random linear and angular velocity (configurable range)
+        lin_vel_range = self.cfg.initial_lin_vel_range
+        ang_vel_range = self.cfg.initial_ang_vel_range
+        root_states[:, 7:10] = (torch.rand(num_envs, 3, device=env.device) * 2 - 1) * lin_vel_range
+        root_states[:, 10:13] = (torch.rand(num_envs, 3, device=env.device) * 2 - 1) * ang_vel_range
 
         # Set position at env origin (default_root_state has relative offset from origin)
+        # Add configurable extra height to drop from above terrain features
         root_states[:, 0:3] = env_origins + root_states[:, 0:3]
+        root_states[:, 2] += self.cfg.spawn_height_offset
+
+        # Add random xy offset only for generated terrain (not flat)
+        if not self._is_flat_terrain:
+            xy_offset = (torch.rand(num_envs, 2, device=env.device) * 2 - 1) * self.cfg.spawn_xy_range
+            root_states[:, 0:2] += xy_offset
 
         # Write root state
         robot.write_root_pose_to_sim(root_states[:, 0:7], env_ids)
         robot.write_root_velocity_to_sim(root_states[:, 7:13], env_ids)
 
-        # Random joint positions within limits
-        joint_pos_limits = robot.data.soft_joint_pos_limits
-        joint_pos = torch.rand(num_envs, robot.num_joints, device=env.device)
-        joint_pos = joint_pos * (joint_pos_limits[:, :, 1] - joint_pos_limits[:, :, 0]) + joint_pos_limits[:, :, 0]
-        joint_vel = (torch.rand(num_envs, robot.num_joints, device=env.device) * 2 - 1) * 1.0
-        robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
+        # Set joint state based on spawn mode
+        if self.cfg.spawn_joint_mode == "default":
+            robot.write_joint_state_to_sim(
+                robot.data.default_joint_pos.clone(),
+                robot.data.default_joint_vel.clone(),
+                env_ids=env_ids,
+            )
+        else:
+            joint_pos_limits = robot.data.soft_joint_pos_limits
+            joint_pos = torch.rand(num_envs, robot.num_joints, device=env.device)
+            joint_pos = joint_pos * (joint_pos_limits[:, :, 1] - joint_pos_limits[:, :, 0]) + joint_pos_limits[:, :, 0]
+            joint_vel = (torch.rand(num_envs, robot.num_joints, device=env.device) * 2 - 1) * 1.0
+            robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
 
         # Reset episode counters to enable joint disabling during fall
         env.episode_length_buf[:] = 0
+
+    def _reset_single_env(self, env: ManagerBasedRLEnv, env_id: int, level: int) -> None:
+        """Reset a single environment that became unstable during falling.
+
+        Args:
+            env: The environment.
+            env_id: The environment index to reset.
+            level: The terrain level for this env.
+        """
+        terrain: TerrainImporter = env.scene.terrain
+        robot: Articulation = env.scene["robot"]
+        device = env.device
+
+        if self._is_flat_terrain:
+            # Flat terrain: use existing env_origin
+            env_origin = env.scene.env_origins[env_id]
+        else:
+            # Generated terrain: get origin from terrain grid
+            terrain_origins = terrain.terrain_origins
+            terrain_type = terrain.terrain_types[env_id].long()
+            env_origin = terrain_origins[level, terrain_type]
+            env.scene.env_origins[env_id] = env_origin
+
+        # Sample new initial pose
+        root_state = robot.data.default_root_state[env_id].clone()
+
+        # Set orientation based on spawn mode
+        if self.cfg.spawn_orientation == "on_back":
+            pitch = torch.empty(1, device=device).uniform_(*self.cfg.spawn_pitch_range).squeeze()
+            yaw = torch.rand(1, device=device).squeeze() * 2 * math.pi - math.pi
+            roll = torch.zeros(1, device=device).squeeze()
+            quat_delta = math_utils.quat_from_euler_xyz(
+                roll.unsqueeze(0), pitch.unsqueeze(0), yaw.unsqueeze(0)
+            ).squeeze(0)
+            root_state[3:7] = math_utils.quat_mul(root_state[3:7].unsqueeze(0), quat_delta.unsqueeze(0)).squeeze(0)
+        else:
+            u1, u2, u3 = torch.rand(3, device=device)
+            sqrt_u1 = torch.sqrt(u1)
+            sqrt_1_minus_u1 = torch.sqrt(1.0 - u1)
+            two_pi_u2 = 2.0 * math.pi * u2
+            two_pi_u3 = 2.0 * math.pi * u3
+            random_quat = torch.tensor(
+                [
+                    sqrt_1_minus_u1 * torch.sin(two_pi_u2),
+                    sqrt_1_minus_u1 * torch.cos(two_pi_u2),
+                    sqrt_u1 * torch.sin(two_pi_u3),
+                    sqrt_u1 * torch.cos(two_pi_u3),
+                ],
+                device=device,
+            )
+            root_state[3:7] = random_quat
+
+        # Random velocities
+        root_state[7:10] = (torch.rand(3, device=device) * 2 - 1) * self.cfg.initial_lin_vel_range
+        root_state[10:13] = (torch.rand(3, device=device) * 2 - 1) * self.cfg.initial_ang_vel_range
+
+        # Position at env origin with offset
+        root_state[0:3] = env_origin + root_state[0:3]
+        root_state[2] += self.cfg.spawn_height_offset
+
+        # Add random xy offset only for generated terrain
+        if not self._is_flat_terrain:
+            xy_offset = (torch.rand(2, device=device) * 2 - 1) * self.cfg.spawn_xy_range
+            root_state[0:2] += xy_offset
+
+        # Write root state
+        env_ids_tensor = torch.tensor([env_id], device=device)
+        robot.write_root_pose_to_sim(root_state[0:7].unsqueeze(0), env_ids_tensor)
+        robot.write_root_velocity_to_sim(root_state[7:13].unsqueeze(0), env_ids_tensor)
+
+        # Set joint state based on spawn mode
+        if self.cfg.spawn_joint_mode == "default":
+            robot.write_joint_state_to_sim(
+                robot.data.default_joint_pos[env_id].unsqueeze(0),
+                robot.data.default_joint_vel[env_id].unsqueeze(0),
+                env_ids=env_ids_tensor,
+            )
+        else:
+            joint_pos_limits = robot.data.soft_joint_pos_limits[env_id]
+            joint_pos = torch.rand(robot.num_joints, device=device)
+            joint_pos = joint_pos * (joint_pos_limits[:, 1] - joint_pos_limits[:, 0]) + joint_pos_limits[:, 0]
+            joint_vel = (torch.rand(robot.num_joints, device=device) * 2 - 1) * 1.0
+            robot.write_joint_state_to_sim(joint_pos.unsqueeze(0), joint_vel.unsqueeze(0), env_ids=env_ids_tensor)
+
+    def _check_unstable_envs(self, env: ManagerBasedRLEnv) -> torch.Tensor:
+        """Check which environments have become unstable (exploding physics).
+
+        Args:
+            env: The environment.
+
+        Returns:
+            Boolean tensor of shape (num_envs,) indicating unstable envs.
+        """
+        robot: Articulation = env.scene["robot"]
+
+        # Get current state
+        root_pos_w = robot.data.root_pos_w
+        root_lin_vel = robot.data.root_lin_vel_w
+        root_ang_vel = robot.data.root_ang_vel_w
+        joint_vel = robot.data.joint_vel
+
+        # Check height above spawn position (env_origin + spawn_height_offset)
+        spawn_height = env.scene.env_origins[:, 2] + self.cfg.spawn_height_offset
+        height_above_spawn = root_pos_w[:, 2] - spawn_height
+        too_high = height_above_spawn > self.cfg.max_height_above_spawn
+
+        # Check linear velocity magnitude
+        lin_vel_mag = torch.norm(root_lin_vel, dim=-1)
+        lin_vel_too_high = lin_vel_mag > self.cfg.max_lin_vel
+
+        # Check angular velocity magnitude
+        ang_vel_mag = torch.norm(root_ang_vel, dim=-1)
+        ang_vel_too_high = ang_vel_mag > self.cfg.max_ang_vel
+
+        # Check joint velocity magnitude (max across all joints)
+        joint_vel_mag = torch.abs(joint_vel).max(dim=-1).values
+        joint_vel_too_high = joint_vel_mag > self.cfg.max_joint_vel
+
+        # Combine all checks
+        unstable = too_high | lin_vel_too_high | ang_vel_too_high | joint_vel_too_high
+
+        return unstable
 
     def _capture_states(self, env: ManagerBasedRLEnv, level: int, terrain: TerrainImporter) -> None:
         """Capture current robot states and add to the dataset."""
@@ -265,19 +514,22 @@ class FallenStateDataset:
         # Convert position to relative (relative to env origin / terrain origin)
         root_pos_rel = root_pos_w - env.scene.env_origins
 
-        # Clamp relative position to stay within terrain cell bounds
-        # This prevents issues when robots roll outside their original cell during falling
-        half_size_x = self._terrain_cell_size[0] / 2.0 - 0.5  # Leave 0.5m margin
-        half_size_y = self._terrain_cell_size[1] / 2.0 - 0.5
-        root_pos_rel[:, 0] = torch.clamp(root_pos_rel[:, 0], -half_size_x, half_size_x)
-        root_pos_rel[:, 1] = torch.clamp(root_pos_rel[:, 1], -half_size_y, half_size_y)
+        # Clamp relative position to stay within terrain cell bounds (skip for flat terrain)
+        if not self._is_flat_terrain:
+            half_size_x = self._terrain_cell_size[0] / 2.0 - 0.5  # Leave 0.5m margin
+            half_size_y = self._terrain_cell_size[1] / 2.0 - 0.5
+            root_pos_rel[:, 0] = torch.clamp(root_pos_rel[:, 0], -half_size_x, half_size_x)
+            root_pos_rel[:, 1] = torch.clamp(root_pos_rel[:, 1], -half_size_y, half_size_y)
 
         # Get joint states
         joint_pos = robot.data.joint_pos.clone()
         joint_vel = robot.data.joint_vel.clone()
 
-        # Get terrain type for each env (needed for correct reset)
-        terrain_type = terrain.terrain_types.clone()
+        # Get terrain type for each env (0 for flat terrain)
+        if self._is_flat_terrain:
+            terrain_type = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+        else:
+            terrain_type = terrain.terrain_types.clone()
 
         # Store on CPU
         storage = self._states_by_level[level]
@@ -358,10 +610,18 @@ class FallenStateDataset:
             "cfg": {
                 "num_spawns_per_level": self.cfg.num_spawns_per_level,
                 "fall_duration_s": self.cfg.fall_duration_s,
+                "spawn_height_offset": self.cfg.spawn_height_offset,
+                "spawn_xy_range": self.cfg.spawn_xy_range,
+                "initial_lin_vel_range": self.cfg.initial_lin_vel_range,
+                "initial_ang_vel_range": self.cfg.initial_ang_vel_range,
+                "spawn_orientation": self.cfg.spawn_orientation,
+                "spawn_pitch_range": self.cfg.spawn_pitch_range,
+                "spawn_joint_mode": self.cfg.spawn_joint_mode,
             },
             "num_terrain_levels": self._num_terrain_levels,
             "num_joints": self._num_joints,
             "terrain_cell_size": self._terrain_cell_size,
+            "is_flat_terrain": self._is_flat_terrain,
             "states_by_level": self._states_by_level,
         }
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
@@ -384,8 +644,9 @@ class FallenStateDataset:
             self._num_terrain_levels = save_dict["num_terrain_levels"]
             self._num_joints = save_dict["num_joints"]
             self._terrain_cell_size = save_dict.get("terrain_cell_size", (8.0, 8.0))
+            self._is_flat_terrain = save_dict.get("is_flat_terrain", False)
             self._states_by_level = save_dict["states_by_level"]
             return True
-        except Exception:
-            logger.exception(f"[FallenStateDataset] Failed to load from {path}")
+        except Exception as e:
+            print(f"[FallenStateDataset] Failed to load from {path}: {e}")
             return False

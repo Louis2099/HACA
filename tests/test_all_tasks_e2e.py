@@ -98,6 +98,8 @@ class TestAllTasks(unittest.TestCase):
             "Velocity-T1-v0",
             # T1 Robot - Stand Up
             "StandUp-T1-v0",
+            # G1 Robot - Stand Up / Lie Down via Height Tracking
+            "HeightTracking-G1-v0",
             # G1 Robot - Pick and Place - Tracking
             "G1-PickPlace-Tracking-v0",
             # ====================================================================
@@ -177,13 +179,22 @@ class TestAllTasks(unittest.TestCase):
                     env["OMNI_HEADLESS"] = "1"
                     env["DISPLAY"] = ":1"
 
-                    # Add fast fallen state collection overrides for StandUp tasks
-                    if "StandUp" in task:
+                    # Add fast fallen state collection overrides for tasks using FallenStateDataset
+                    if "StandUp" in task or "HeightTracking" in task:
                         cmd.extend(
                             [
                                 "agent.fallen_state_dataset_cfg.num_spawns_per_level=1",
                                 "agent.fallen_state_dataset_cfg.fall_duration_s=0.1",
                                 "agent.fallen_state_dataset_cfg.cache_enabled=False",
+                            ]
+                        )
+                    # HeightTracking has a secondary (random-orientation) dataset on top
+                    if "HeightTracking" in task:
+                        cmd.extend(
+                            [
+                                "agent.fallen_state_dataset_secondary_cfg.num_spawns_per_level=1",
+                                "agent.fallen_state_dataset_secondary_cfg.fall_duration_s=0.1",
+                                "agent.fallen_state_dataset_secondary_cfg.cache_enabled=False",
                             ]
                         )
 

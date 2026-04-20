@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 from dataclasses import MISSING, field
 from typing import Literal
 
@@ -147,7 +148,7 @@ class LiftActionCfg(ActionTermCfg):
     """Action term to simulate a lift.
 
     Applies external forces to lift the robot up and torques to damp angular velocity.
-    Use with a curriculum term (e.g., `remove_harness` or `adaptive_lift_curriculum`)
+    Use with a curriculum term (e.g., `remove_harness` or `adaptive_force_decay`)
     to reduce forces over training.
     """
 
@@ -160,7 +161,10 @@ class LiftActionCfg(ActionTermCfg):
     damping_forces: float = 0.0
     """The damping (D gain) for height tracking. Defaults to 0.0."""
     force_limit: float = 0.0
-    """The maximum force to apply. Defaults to 0.0."""
+    """The maximum force to apply. Defaults to 0.0. Overridden by force_limit_weight_fraction if set."""
+    force_limit_weight_fraction: float | None = None
+    """If set, overrides force_limit with this fraction of the robot's total weight (mass * gravity).
+    E.g., 0.9 means the lift can apply up to 90% of the robot's weight. Defaults to None."""
     damping_torques: float = 0.0
     """The damping for angular velocity (D term). Applies torques opposing yaw rotation. Defaults to 0.0."""
     torque_limit: float = 0.0
@@ -171,10 +175,18 @@ class LiftActionCfg(ActionTermCfg):
     """The target standing height. Defaults to 0.71."""
     height_command: str | None = None
     """Optional command term name for dynamic height targets."""
+    allow_push_down: bool = False
+    """If True, forces can be negative (push down). If False (default), only upward forces are applied."""
     start_lifting_time_s: float = 0.0
     """Delay before lifting starts (seconds). Defaults to 0.0."""
     lifting_duration_s: float = 10.0
-    """How many seconds the lift should take to move from start to end"""
+    """Time to ramp from 0 to target height (seconds). Defaults to 10.0."""
+    force_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    """Offset in body frame (x, y, z) from body origin where force is applied.
+
+    Positive z shifts the application point upward along the body's local z-axis.
+    This is useful to apply the lift force at a higher point than the body origin,
+    e.g., at the chest instead of the pelvis. Defaults to (0.0, 0.0, 0.0)."""
 
 
 @configclass

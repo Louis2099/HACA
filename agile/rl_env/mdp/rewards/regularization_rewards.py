@@ -18,6 +18,7 @@ from collections.abc import Sequence
 
 import torch
 
+from isaaclab.assets import Articulation
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.envs.mdp.rewards import action_l2
 from isaaclab.managers import ManagerTermBase, SceneEntityCfg
@@ -124,6 +125,23 @@ def action_rate_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEnti
     )
 
 
+def joint_pos_tracking_error_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    action_name: str = "joint_pos",
+) -> torch.Tensor:
+    """Penalize deviation between PD target and actual joint positions.
+
+    Discourages commanding joint targets far from the current position,
+    which produces high torques and jerky motion.
+    """
+    robot: Articulation = env.scene[asset_cfg.name]
+    action_term = env.action_manager._terms[action_name]
+    target = action_term.processed_actions  # (num_envs, num_joints) — the actual PD position target
+    current = robot.data.joint_pos[:, action_term._joint_ids]
+    return torch.sum(torch.square(target - current), dim=1)
+
+
 def action_rate_l2_if_actor_active(
     env: ManagerBasedRLEnv, rest_duration_s: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
@@ -140,6 +158,18 @@ def action_l2_if_actor_active(env: ManagerBasedRLEnv, rest_duration_s: float) ->
     env_in_rest_phase = env.episode_length_buf < int(rest_duration_s / env.step_dt)
     action[env_in_rest_phase] = 0
     return action
+
+
+def joint_deviation_l1(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg | None = None,
+) -> torch.Tensor:
+    """Reward for penalizing joint deviation from default angles (L1 norm)."""
+    robot, robot_cfg = get_robot_cfg(env, robot_cfg)
+    return torch.sum(
+        torch.abs(robot.data.joint_pos[:, robot_cfg.joint_ids] - robot.data.default_joint_pos[:, robot_cfg.joint_ids]),
+        dim=1,
+    )
 
 
 def joint_deviation_l2(

@@ -154,3 +154,33 @@ STAND_UP_ROUGH_TERRAIN_CFG = TerrainGeneratorCfg(
         "wave_small": terrain_gen.HfWaveTerrainCfg(proportion=0.3, amplitude_range=(0.01, 0.15), num_waves=3),
     },
 )
+
+
+STAND_UP_ROUGH_TERRAIN_G1_CFG = TerrainGeneratorCfg(
+    seed=42,  # Fixed seed for deterministic terrain generation (enables caching)
+    size=(8.0, 8.0),
+    border_width=100.0,
+    num_rows=8,  # num different difficulties
+    num_cols=9,  # num terrains per same difficulty level
+    horizontal_scale=0.1,
+    vertical_scale=0.01,
+    slope_threshold=0.9,
+    use_cache=False,
+    sub_terrains={
+        "boxes": terrain_gen.MeshRandomGridTerrainCfg(
+            proportion=0.2,
+            grid_width=0.45,
+            grid_height_range=(0.01, 0.075),
+            platform_width=0.1,
+        ),
+        "random_rough_small": HfRandomUniformTerrainDifficultyCfg(
+            proportion=0.2,
+            noise_range=(0.01, 0.1),
+            noise_step=0.01,
+            border_width=0.4,
+        ),
+        "wave_small": terrain_gen.HfWaveTerrainCfg(
+            proportion=0.2, amplitude_range=(0.01, 0.15), num_waves=4, border_width=0.2
+        ),
+    },
+)

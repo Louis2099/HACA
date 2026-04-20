@@ -110,6 +110,34 @@ def mirror_joints_G1(actions: torch.Tensor, env: ManagerBasedRLEnv) -> torch.Ten
     return mirrored_actions
 
 
+def mirror_bodies_G1(bodies: torch.Tensor, env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Left-right mirroring of all robot bodies."""
+    mirrored_indices = resolve_body_names_g1(tuple(env.unwrapped.scene.articulations["robot"].body_names))
+    mirrored_bodies = bodies.clone()
+    mirrored_bodies[..., mirrored_indices] = bodies
+    return mirrored_bodies
+
+
+@lru_cache(maxsize=10)
+def resolve_body_names_g1(body_names: tuple[str, ...]) -> list[int]:
+    """Resolve body names to mirrored body indices."""
+    mirrored_indices = []
+    for source_body_name in body_names:
+        if "left" in source_body_name:
+            mirrored_body_name = source_body_name.replace("left", "right")
+        elif "right" in source_body_name:
+            mirrored_body_name = source_body_name.replace("right", "left")
+        else:
+            mirrored_body_name = source_body_name
+
+        if mirrored_body_name not in body_names:
+            raise ValueError(f"Mirrored body name {mirrored_body_name} not found in body names")
+
+        mirrored_indices.append(body_names.index(mirrored_body_name))
+
+    return mirrored_indices
+
+
 @lru_cache(maxsize=10)
 def resolve_joint_names_g1(action_joint_names: tuple[str, ...]) -> tuple[list[int], list[int]]:
     """Resolve the joint names to indices.
@@ -189,11 +217,13 @@ OBS_TO_MIRROR: dict[str, Callable] = {
     "controlled_joint_vel": mirror_actions_G1,
     "velocity_commands": mirror_velocity_commands,
     "velocity_height_commands": mirror_velocity_commands,
+    "height_command": identity,
     "height_commands": identity,
     "gait_cycle_commands": mirror_gait_cycle_commands,
     "height_scan": mirror_height_scan_left_right,
     "height_scan_feet": mirror_height_scan_feet_left_right,
     "base_height": identity,
+    "contact_forces": mirror_bodies_G1,
     "external_force_torque": mirror_external_force_torque,
     "base_com": mirror_base_com,
     "actuator_gains": mirror_actuator_gains,
