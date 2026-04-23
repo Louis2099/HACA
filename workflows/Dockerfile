@@ -7,7 +7,7 @@ ARG RESUME_STAGE=no
 ###############################
 # Base Stage
 ###############################
-FROM nvcr.io/nvidia/isaac-lab:2.3.1 AS base
+FROM nvcr.io/nvidia/isaac-lab:2.3.2 AS base
 
 # Fix potential Vulkan conflicts
 RUN if [ -e "/usr/share/vulkan" ] && [ -e "/etc/vulkan" ]; then \

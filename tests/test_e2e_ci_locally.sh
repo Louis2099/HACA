@@ -26,7 +26,7 @@ NC='\033[0m' # No Color
 echo -e "${BLUE}=== TESTING E2E IN CI ENVIRONMENT LOCALLY ===${NC}"
 
 # Docker image used in CI
-DOCKER_IMAGE="nvcr.io/nvidia/isaac-lab:2.3.1"
+DOCKER_IMAGE="nvcr.io/nvidia/isaac-lab:2.3.2"
 
 echo -e "${YELLOW}This will pull and run the Docker image: ${DOCKER_IMAGE}${NC}"
 echo -e "${YELLOW}Make sure you have Docker installed and running.${NC}"
