@@ -503,12 +503,24 @@ class PPO:
             if self.use_l2c2 and l2c2_batch is not None:
                 prev_obs_batch, next_obs_batch, prev_priv_obs_batch, next_priv_obs_batch, done_mask_batch = l2c2_batch
 
-                interpolation_factor = torch.rand(prev_obs_batch.shape[0], 1, device=self.device)
+                batch_size = prev_obs_batch.shape[0]
+                # Shape interpolation factor to match obs layout:
+                # - Regular tensor [batch, obs_dim]: use [batch, 1] to broadcast over features
+                # - TensorDict or 1D tensor [batch]: use [batch] (features are inside TD leaves)
+                if prev_obs_batch.dim() >= 2:
+                    interpolation_factor = torch.rand(batch_size, 1, device=self.device)
+                else:
+                    interpolation_factor = torch.rand(batch_size, device=self.device)
                 interpolated_obs = prev_obs_batch + interpolation_factor * (next_obs_batch - prev_obs_batch)
-                interpolated_priv_obs = prev_priv_obs_batch + interpolation_factor * (next_priv_obs_batch - prev_priv_obs_batch)
-                
-                distance =torch.nn.MSELoss()
-                l2c2_actor_loss = distance(self.policy.act_inference(interpolated_obs[~done_mask_batch]), self.policy.act_inference(prev_obs_batch[~done_mask_batch])) 
+
+                if prev_priv_obs_batch.dim() >= 2:
+                    priv_interpolation_factor = torch.rand(batch_size, 1, device=self.device)
+                else:
+                    priv_interpolation_factor = torch.rand(batch_size, device=self.device)
+                interpolated_priv_obs = prev_priv_obs_batch + priv_interpolation_factor * (next_priv_obs_batch - prev_priv_obs_batch)
+
+                distance = torch.nn.MSELoss()
+                l2c2_actor_loss = distance(self.policy.act_inference(interpolated_obs[~done_mask_batch]), self.policy.act_inference(prev_obs_batch[~done_mask_batch]))
                 l2c2_critic_loss = distance(self.policy.evaluate(interpolated_priv_obs[~done_mask_batch]), self.policy.evaluate(prev_priv_obs_batch[~done_mask_batch]))
                 loss += self.lambda_actor * l2c2_actor_loss
                 loss += self.lambda_critic * l2c2_critic_loss

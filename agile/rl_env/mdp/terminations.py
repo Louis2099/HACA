@@ -26,6 +26,59 @@ from isaaclab.utils.math import subtract_frame_transforms
 from agile.rl_env.mdp.utils import get_robot_cfg
 
 
+def ground_slam(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    velocity_threshold: float = 2.0,
+    force_threshold: float = 10.0,
+    prerequisite_curriculum: str | None = None,
+    prerequisite_threshold: float = 0.01,
+    prerequisite_direction: str = "below",
+) -> torch.Tensor:
+    """Terminate if any monitored body slams the ground with high impact velocity.
+
+    Uses the contact sensor's velocity history buffer to detect impact velocity at contact onset.
+    Only activates after an optional prerequisite curriculum reaches a threshold, so it doesn't
+    interfere with early training (e.g., while the robot is still learning to stand up).
+
+    Args:
+        env: The environment instance.
+        sensor_cfg: Contact sensor config with body_names specifying which bodies to monitor.
+        velocity_threshold: Maximum allowed impact velocity (m/s).
+        force_threshold: Minimum contact force (N) to consider a body as "in contact".
+        prerequisite_curriculum: If set, termination is only active when this curriculum
+            value crosses the threshold (e.g., "adaptive_lift" must reach ~0 before enabling).
+        prerequisite_threshold: Threshold value for the prerequisite curriculum.
+        prerequisite_direction: "below" = active when curriculum < threshold,
+            "above" = active when curriculum > threshold.
+    """
+    # Check prerequisite curriculum gate
+    if prerequisite_curriculum is not None:
+        prereq_value = env.curriculum_manager._curriculum_state.get(prerequisite_curriculum)
+        if prereq_value is None:
+            return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        if prerequisite_direction == "below" and prereq_value >= prerequisite_threshold:
+            return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        if prerequisite_direction == "above" and prereq_value < prerequisite_threshold:
+            return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+
+    net_contact_forces = contact_sensor.data.net_forces_w_history
+    in_contact = (
+        torch.max(torch.norm(net_contact_forces[:, :, sensor_cfg.body_ids], dim=-1), dim=1)[0] > force_threshold
+    )
+
+    body_velocities = torch.max(
+        torch.norm(contact_sensor.data.velocities_w_history[:, :, sensor_cfg.body_ids], dim=-1),
+        dim=1,
+    )[0]
+
+    # Terminate if ANY monitored body is in contact AND exceeds velocity threshold
+    slam_detected = in_contact & (body_velocities > velocity_threshold)
+    return torch.any(slam_detected, dim=1)
+
+
 def illegal_ground_contact(
     env: ManagerBasedRLEnv,
     threshold: float,
@@ -233,6 +286,50 @@ def link_distance(
     return too_close
 
 
+def illegal_link_distance_lateral(
+    env: ManagerBasedRLEnv,
+    min_distance_threshold: float = 0.05,
+    max_distance_threshold: float | None = None,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),  # noqa: B008
+) -> torch.Tensor:
+    """Terminate if the lateral (Y-axis in root frame) distance between two links is outside range.
+
+    Projects the link positions into the root body frame and checks the Y-axis separation.
+    This allows large forward/backward steps while constraining lateral splay.
+
+    Args:
+        env: Environment instance
+        min_distance_threshold: Minimum lateral distance. Terminate if closer than this.
+        max_distance_threshold: Maximum lateral distance. Terminate if farther than this. None to disable.
+        asset_cfg: Asset configuration (must specify exactly 2 links)
+
+    Returns:
+        Boolean tensor indicating which environments should terminate
+    """
+    robot, _ = get_robot_cfg(env, asset_cfg)
+    link_pos_w = robot.data.body_pos_w[:, asset_cfg.body_ids]
+
+    if len(asset_cfg.body_ids) != 2:
+        raise ValueError("Link distance is only supported for 2 links")
+
+    # Transform link positions into root frame
+    root_pos = robot.data.root_pos_w
+    root_quat = robot.data.root_quat_w
+    link0_b, _ = subtract_frame_transforms(root_pos, root_quat, link_pos_w[:, 0])
+    link1_b, _ = subtract_frame_transforms(root_pos, root_quat, link_pos_w[:, 1])
+
+    # Lateral distance = Y-axis separation in root frame
+    lateral_dist = torch.abs(link0_b[:, 1] - link1_b[:, 1])
+
+    too_close = lateral_dist < min_distance_threshold
+
+    if max_distance_threshold is not None:
+        too_far = lateral_dist > max_distance_threshold
+        return too_close | too_far
+
+    return too_close
+
+
 class standing(ManagerTermBase):
     def __init__(self, cfg: EventTermCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
@@ -373,6 +470,61 @@ def bad_motion_body_pos_z_only(
     body_indices = _get_body_indices(command, body_names)
     error = torch.abs(command.body_pos_relative_w[:, body_indices, -1] - command.robot_body_pos_w[:, body_indices, -1])
     return torch.any(error > threshold, dim=-1)
+
+
+def invalid_state(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),  # noqa: B008
+    max_joint_vel: float = 100.0,
+    max_root_height: float = 10.0,
+    max_root_xy_distance: float = 200.0,
+    max_lin_vel: float = 50.0,
+    max_ang_vel: float = 100.0,
+) -> torch.Tensor:
+    """Terminate when physics values explode (NaN or exceeding thresholds).
+
+    This termination detects simulation instabilities before they cause NaN propagation.
+    It checks for NaN states, joint velocities, root position, and root velocities.
+
+    Args:
+        env: The environment instance.
+        asset_cfg: Configuration for the robot asset.
+        max_joint_vel: Maximum allowed joint velocity magnitude (rad/s). Default: 100.0
+        max_root_height: Maximum allowed root height above env origin (m). Default: 10.0
+        max_root_xy_distance: Maximum allowed XY distance from env origin (m). Default: 50.0
+        max_lin_vel: Maximum allowed linear velocity magnitude (m/s). Default: 50.0
+        max_ang_vel: Maximum allowed angular velocity magnitude (rad/s). Default: 100.0
+
+    Returns:
+        Boolean tensor indicating which environments have invalid states.
+    """
+    robot: Articulation = env.scene[asset_cfg.name]
+
+    # Check for NaN in any state
+    has_nan = (
+        torch.isnan(robot.data.joint_pos).any(dim=-1)
+        | torch.isnan(robot.data.joint_vel).any(dim=-1)
+        | torch.isnan(robot.data.root_pos_w).any(dim=-1)
+        | torch.isnan(robot.data.root_lin_vel_w).any(dim=-1)
+        | torch.isnan(robot.data.root_ang_vel_w).any(dim=-1)
+    )
+
+    # Check joint velocities
+    joint_vel_exceeded = torch.abs(robot.data.joint_vel).max(dim=-1).values > max_joint_vel
+
+    # Check root position (relative to env origin)
+    root_pos_rel = robot.data.root_pos_w - env.scene.env_origins
+    root_height_exceeded = root_pos_rel[:, 2] > max_root_height
+    root_xy_exceeded = torch.norm(root_pos_rel[:, :2], dim=-1) > max_root_xy_distance
+
+    # Check linear velocity
+    lin_vel_exceeded = torch.norm(robot.data.root_lin_vel_w, dim=-1) > max_lin_vel
+
+    # Check angular velocity
+    ang_vel_exceeded = torch.norm(robot.data.root_ang_vel_w, dim=-1) > max_ang_vel
+
+    # Combine all checks
+    return has_nan | joint_vel_exceeded | root_height_exceeded | root_xy_exceeded | lin_vel_exceeded | ang_vel_exceeded
 
 
 def out_of_bound(

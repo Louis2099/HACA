@@ -52,6 +52,7 @@ class reset_from_fallen_dataset(ManagerTermBase):
         """
         super().__init__(cfg, env)
         self._dataset: FallenStateDataset | None = None
+        self._secondary_dataset: FallenStateDataset | None = None
 
     def set_dataset(self, dataset: FallenStateDataset) -> None:
         """Inject the fallen state dataset after collection.
@@ -61,16 +62,31 @@ class reset_from_fallen_dataset(ManagerTermBase):
         """
         self._dataset = dataset
 
+    def set_secondary_dataset(self, dataset: FallenStateDataset) -> None:
+        """Inject a secondary fallen state dataset (e.g., random orientation).
+
+        Args:
+            dataset: The pre-collected secondary fallen state dataset.
+        """
+        self._secondary_dataset = dataset
+
     @property
     def has_dataset(self) -> bool:
         """Check if a dataset has been set and is collected."""
         return self._dataset is not None and self._dataset.is_collected
+
+    @property
+    def has_secondary_dataset(self) -> bool:
+        """Check if a secondary dataset has been set and is collected."""
+        return self._secondary_dataset is not None and self._secondary_dataset.is_collected
 
     def __call__(
         self,
         env: ManagerBasedRLEnv,
         env_ids: torch.Tensor,
         standing_ratio: float = 0.1,
+        height_offset: float = 0.0,
+        random_fallen_ratio: float = 0.0,
         asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     ) -> None:
         """Reset environments to sampled fallen states or standing poses.
@@ -79,6 +95,11 @@ class reset_from_fallen_dataset(ManagerTermBase):
             env: The environment instance.
             env_ids: Environment indices to reset.
             standing_ratio: Fraction of envs to reset to standing pose (default 0.1).
+            height_offset: Extra height to add when spawning from dataset (default 0.0).
+                This helps avoid spawning inside rough terrain features.
+            random_fallen_ratio: Fraction of fallen envs to sample from the secondary
+                (random orientation) dataset instead of the primary. Only effective when
+                a secondary dataset has been set. Ramped via curriculum.
             asset_cfg: Asset configuration for the robot.
 
         Raises:
@@ -107,8 +128,33 @@ class reset_from_fallen_dataset(ManagerTermBase):
             if not self.has_dataset:
                 # Dataset not ready (e.g., during collection phase) - fall back to standing
                 self._reset_to_standing(env, fallen_env_ids, asset)
+            elif random_fallen_ratio > 0:
+                if not self.has_secondary_dataset:
+                    raise RuntimeError(
+                        "random_fallen_ratio > 0 but no secondary dataset is set. "
+                        "Configure fallen_state_dataset_secondary_cfg in the agent cfg, "
+                        "or keep random_fallen_ratio at 0."
+                    )
+                # Split fallen envs between primary and secondary datasets
+                secondary_mask = torch.rand(len(fallen_env_ids), device=env.device) < random_fallen_ratio
+                primary_mask = ~secondary_mask
+
+                primary_env_ids = fallen_env_ids[primary_mask]
+                secondary_env_ids = fallen_env_ids[secondary_mask]
+
+                if len(primary_env_ids) > 0:
+                    self._reset_from_dataset(env, primary_env_ids, asset, terrain, height_offset)
+                if len(secondary_env_ids) > 0:
+                    self._reset_from_dataset(
+                        env,
+                        secondary_env_ids,
+                        asset,
+                        terrain,
+                        height_offset,
+                        dataset=self._secondary_dataset,
+                    )
             else:
-                self._reset_from_dataset(env, fallen_env_ids, asset, terrain)
+                self._reset_from_dataset(env, fallen_env_ids, asset, terrain, height_offset)
 
     def _reset_to_standing(
         self,
@@ -150,29 +196,51 @@ class reset_from_fallen_dataset(ManagerTermBase):
         env_ids: torch.Tensor,
         asset: RigidObject | Articulation,
         terrain: TerrainImporter,
+        height_offset: float = 0.0,
+        dataset: FallenStateDataset | None = None,
     ) -> None:
-        """Reset environments to sampled fallen states from dataset."""
-        if self._dataset is None:
+        """Reset environments to sampled fallen states from dataset.
+
+        Args:
+            env: The environment instance.
+            env_ids: Environment indices to reset.
+            asset: The robot asset.
+            terrain: The terrain importer.
+            height_offset: Extra height offset for spawning.
+            dataset: Dataset to sample from. Defaults to the primary dataset.
+        """
+        if dataset is None:
+            dataset = self._dataset
+        if dataset is None:
             raise RuntimeError("Dataset not set. Call set_dataset() before _reset_from_dataset().")
 
-        # Get terrain levels for each env
-        terrain_levels = terrain.terrain_levels[env_ids]
+        # Check if using flat terrain (no terrain_generator)
+        is_flat_terrain = terrain.cfg.terrain_generator is None
+
+        if is_flat_terrain:
+            # Flat terrain: use level 0, keep existing env_origins
+            terrain_levels = torch.zeros(len(env_ids), dtype=torch.long, device=env.device)
+            env_origins = env.scene.env_origins[env_ids]
+        else:
+            # Generated terrain: get levels from terrain
+            terrain_levels = terrain.terrain_levels[env_ids]
 
         # Sample states from dataset (includes terrain_type where state was collected)
-        states = self._dataset.sample(len(env_ids), terrain_levels, device=env.device)
+        states = dataset.sample(len(env_ids), terrain_levels, device=env.device)
 
-        # Update terrain types and env origins to match where states were collected
-        # This ensures the relative position is applied to the correct terrain cell
-        sampled_terrain_types = states["terrain_type"]
-        terrain.terrain_types[env_ids] = sampled_terrain_types
+        if not is_flat_terrain:
+            # Update terrain types and env origins to match where states were collected
+            sampled_terrain_types = states["terrain_type"]
+            terrain.terrain_types[env_ids] = sampled_terrain_types
 
-        # Get the correct env origins from terrain_origins using level and sampled type
-        # terrain_origins has shape (num_levels, num_types, 3)
-        env_origins = terrain.terrain_origins[terrain_levels.long(), sampled_terrain_types.long()]
-        env.scene.env_origins[env_ids] = env_origins
+            # Get the correct env origins from terrain_origins using level and sampled type
+            env_origins = terrain.terrain_origins[terrain_levels.long(), sampled_terrain_types.long()]
+            env.scene.env_origins[env_ids] = env_origins
 
         # Convert relative position to world position using the correct origin
+        # Add height_offset to avoid spawning inside terrain features
         root_pos_w = states["root_pos_rel"] + env_origins
+        root_pos_w[:, 2] += height_offset
 
         # Construct root pose and velocity
         root_pose = torch.cat([root_pos_w, states["root_quat"]], dim=-1)

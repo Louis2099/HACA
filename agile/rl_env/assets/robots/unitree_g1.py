@@ -14,6 +14,8 @@
 # limitations under the License.
 
 
+import copy as _copy
+
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg
@@ -862,3 +864,51 @@ for _a in G1_W_HANDS_AGILE_CFG.actuators.values():
     for _n in _names:
         if _n in _e and _n in _s and _s[_n]:
             G1_W_HANDS_AGILE_ACTION_SCALE[_n] = 0.25 * _e[_n] / _s[_n]
+
+G1_NO_HANDS_AGILE_ACTION_SCALE = {k: v for k, v in G1_W_HANDS_AGILE_ACTION_SCALE.items() if "hand" not in k}
+
+
+# ---------------------------------------------------------------------------
+# G1 29-DOF config tuned for HeightTracking (stand-up / lie-down).
+# Derived from G1_29DOF_DELAYED_DC_MOTOR with lower stiffness/damping,
+# uniform saturation effort, and added joint friction.
+# ---------------------------------------------------------------------------
+
+G1_29DOF_HEIGHT_TRACKING = _copy.deepcopy(G1_29DOF_DELAYED_DC_MOTOR)
+
+_ht_actuators = G1_29DOF_HEIGHT_TRACKING.actuators
+# Legs: softer knees
+_ht_actuators["legs"].stiffness[".*_knee_joint"] = 100.0
+_ht_actuators["legs"].damping[".*_knee_joint"] = 2.5
+_ht_actuators["legs"].armature = 0.02
+_ht_actuators["legs"].friction = 0.01
+_ht_actuators["legs"].saturation_effort = 130.0
+# Feet: higher damping for stability
+_ht_actuators["feet"].damping[".*_ankle_pitch_joint"] = 1.0
+_ht_actuators["feet"].damping[".*_ankle_roll_joint"] = 1.0
+_ht_actuators["feet"].friction = 0.01
+_ht_actuators["feet"].saturation_effort = 130.0
+# Waist: much softer for compliant torso
+_ht_actuators["waist"].stiffness = {"waist_yaw_joint": 100.0, "waist_roll_joint": 100.0, "waist_pitch_joint": 100.0}
+_ht_actuators["waist"].damping = {"waist_yaw_joint": 2.5, "waist_roll_joint": 2.5, "waist_pitch_joint": 2.5}
+_ht_actuators["waist"].friction = 0.01
+_ht_actuators["waist"].saturation_effort = 130.0
+# Arms: uniform low stiffness/damping for relaxed arms
+_ht_actuators["arms"].stiffness = {
+    ".*_shoulder_pitch_joint": 20.0,
+    ".*_shoulder_roll_joint": 20.0,
+    ".*_shoulder_yaw_joint": 20.0,
+    ".*_elbow_joint": 20.0,
+    ".*_wrist_.*_joint": 20.0,
+}
+_ht_actuators["arms"].damping = {
+    ".*_shoulder_pitch_joint": 0.5,
+    ".*_shoulder_roll_joint": 0.5,
+    ".*_shoulder_yaw_joint": 0.5,
+    ".*_elbow_joint": 0.5,
+    ".*_wrist_.*_joint": 0.2,
+}
+_ht_actuators["arms"].armature = 0.02
+_ht_actuators["arms"].friction = 0.01
+_ht_actuators["arms"].saturation_effort = 130.0
+del _ht_actuators

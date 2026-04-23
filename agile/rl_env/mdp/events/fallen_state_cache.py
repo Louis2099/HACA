@@ -24,15 +24,20 @@ import os
 
 # Cache format version - increment this when the dataset format changes
 # to invalidate old caches
-_CACHE_VERSION = 3  # v3: Include full terrain config in cache key
+_CACHE_VERSION = 6  # v6: Per-dataset config hashing for dual-dataset support
 
 
-def compute_fallen_state_cache_key(task_name: str, terrain_cfg: dict | None) -> str:
-    """Compute a cache key for fallen states based on task name and terrain config.
+def compute_fallen_state_cache_key(
+    task_name: str, terrain_cfg: dict | None, dataset_cfg_dict: dict | None = None
+) -> str:
+    """Compute a cache key for fallen states based on task name, terrain, and dataset config.
 
     Args:
         task_name: Name of the task (e.g., 'Template-Isaac-Stand-Up-T1-v0')
         terrain_cfg: Terrain generator configuration dictionary (deeply nested)
+        dataset_cfg_dict: Optional dict of dataset-specific parameters that affect
+            the collected states (e.g., spawn_orientation, spawn_joint_mode).
+            When provided, hashed into the cache key to differentiate datasets.
 
     Returns:
         Cache key string suitable for filename
@@ -43,12 +48,19 @@ def compute_fallen_state_cache_key(task_name: str, terrain_cfg: dict | None) -> 
         terrain_str = json.dumps(terrain_cfg, sort_keys=True, default=str)
         terrain_hash = hashlib.md5(terrain_str.encode()).hexdigest()[:8]
     else:
-        terrain_hash = "default"
+        terrain_hash = "flat"
+
+    # Hash dataset config if available
+    if dataset_cfg_dict is not None:
+        dataset_str = json.dumps(dataset_cfg_dict, sort_keys=True, default=str)
+        dataset_hash = hashlib.md5(dataset_str.encode()).hexdigest()[:8]
+    else:
+        dataset_hash = "default"
 
     # Clean task name for filename
     task_clean = task_name.replace("-", "_").replace(" ", "_")
 
-    return f"fallen_states_v{_CACHE_VERSION}_{task_clean}_{terrain_hash}.pt"
+    return f"fallen_states_v{_CACHE_VERSION}_{task_clean}_{terrain_hash}_{dataset_hash}.pt"
 
 
 def get_fallen_state_cache_path(cache_dir: str, cache_key: str) -> str:
