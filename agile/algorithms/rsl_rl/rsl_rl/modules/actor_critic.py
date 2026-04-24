@@ -142,7 +142,9 @@ class ActorCritic(nn.Module):
         mean = self.actor(observations)
         # compute standard deviation
         if self.noise_std_type == "scalar":
-            std = torch.clamp(self.std.expand_as(mean), min=1e-6)
+            # nan_to_num closes a gap with the log/pred branches: if an upstream
+            # step leaves NaN in self.std, Normal(mean, NaN) would crash the run.
+            std = torch.clamp(torch.nan_to_num(self.std, nan=1e-2).expand_as(mean), min=1e-6)
         elif self.noise_std_type == "log":
             std = torch.exp(torch.clamp(self.log_std, min=self.log_std_range[0], max=self.log_std_range[1])).expand_as(
                 mean
