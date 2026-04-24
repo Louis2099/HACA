@@ -514,8 +514,8 @@ class ObservationProcessor:
         For motion tracking policies: returns cat([target_joint_pos, target_joint_vel])
         from the motion data (in the policy's joint ordering).
 
-        For velocity/height policies: returns [vx, vy, wz, height] padded to
-        the expected dimension.
+        For velocity/height policies: returns the CommandManager's
+        [vx, vy, wz, height] resized (padded or truncated) to the expected dim.
         """
         if self.motion_tracker is not None:
             return self.motion_tracker.get_command()
@@ -526,10 +526,14 @@ class ObservationProcessor:
         else:
             cmd = torch.tensor([0.0, 0.0, 0.0, 0.72], device=self.device, dtype=torch.float32)
 
-        # Pad to expected dimension if needed.
+        # Resize to expected dimension: pad with zeros if short, drop trailing
+        # entries if long. Velocity-only policies (obs_dim == 3) expect
+        # [vx, vy, wz] and must not receive the trailing height entry.
         if cmd.shape[0] < term.obs_dim:
             padding = torch.zeros(term.obs_dim - cmd.shape[0], device=self.device, dtype=torch.float32)
             cmd = torch.cat([cmd, padding], dim=0)
+        elif cmd.shape[0] > term.obs_dim:
+            cmd = cmd[: term.obs_dim]
 
         return cmd
 
