@@ -511,15 +511,13 @@ class CurriculumCfg:
     )
 
     adaptive_lift = CurrTerm(
-        func=mdp.adaptive_lift_curriculum,
+        func=mdp.adaptive_force_decay,
         params={
-            "lift_action_name": "lift",
+            "action_name": "lift",
             "standing_height_threshold": booster_t1.DEFAULT_TRUNK_HEIGHT - 0.1,
-            "standing_ratio_to_decrease": 0.7,
+            "threshold": 0.7,
             "ema_alpha": 0.01,
-            "epsilon": 0.0001,
-            "force_scale_disable_threshold": 0.01,
-            "only_decrease": True,
+            "disable_threshold": 0.01,
         },
     )
 
