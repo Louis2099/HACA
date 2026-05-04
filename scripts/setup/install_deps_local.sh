@@ -46,7 +46,7 @@ fi
 
 # Check that IsaacLab is using the correct version.
 if [ -d ${ISAACLAB_PATH}/.git ]; then
-  expected_isaac_lab_tag="v2.3.1"
+  expected_isaac_lab_tag="v2.3.2"
   if ! git -C ${ISAACLAB_PATH} tag -l "${expected_isaac_lab_tag}" | grep -q "${expected_isaac_lab_tag}"; then
       echo "Error: IsaacLab does not have the expected tag."
       echo "Expected tag: ${expected_isaac_lab_tag}"

@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+import isaaclab.utils.math as math_utils
 from isaaclab.assets.articulation import Articulation
 from isaaclab.managers.action_manager import ActionTerm
 from isaaclab.sensors import RayCaster
@@ -192,11 +193,16 @@ class LiftAction(ActionTerm):
             # Clamp torques
             torques_w[:, 2] = torch.clamp(torques_w[:, 2], -self._torque_limit, self._torque_limit)
 
-        # Isaac Lab 2.3.1 does not expose permanent_wrench_composer, so we fall back to
-        # set_external_force_and_torque which applies the wrench at the body origin.
-        # The force_offset field is not respected in this code path.
-        self._asset.set_external_force_and_torque(
-            forces=forces, torques=torques_w.unsqueeze(1), body_ids=self._lift_link_id, is_global=True
+        # rotate forces and torques to body frame
+        link_quat = self._asset.data.body_quat_w[:, self._lift_link_id].squeeze(1)
+        forces_b = math_utils.quat_apply_inverse(link_quat, forces)
+        torques_b = math_utils.quat_apply_inverse(link_quat, torques_w.unsqueeze(1))
+
+        # Compute positions for force application (offset from body origin in local frame)
+        positions = self._force_offset.unsqueeze(0).unsqueeze(0).expand(forces_b.shape[0], 1, 3)
+
+        self._asset.permanent_wrench_composer.set_forces_and_torques(
+            forces=forces_b, torques=torques_b, positions=positions, body_ids=self._lift_link_id
         )
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
