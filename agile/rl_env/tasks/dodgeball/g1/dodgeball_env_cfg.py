@@ -131,7 +131,18 @@ class DodgeballObservationsCfg:
 
 @configclass
 class DodgeballRewardsCfg(RewardsCfg):
-    """Base locomotion rewards with dodgeball-specific safety shaping."""
+    """Base locomotion rewards with dodgeball-specific safety shaping.
+
+    Orientation-based shaping rewards that conflict with extreme in-place dodging
+    maneuvers are removed:
+    - flat_orientation: penalised non-upright torso — incompatible with swallow balance.
+    - feet_yaw_diff / feet_yaw_mean: foot orientation relative to base — irrelevant when
+      the robot may pivot a foot to maintain CoM balance.
+    - hip_pos_pen: reduced to a soft guard only (weight -0.1 instead of -1.0).
+
+    These are replaced by com_balance, which rewards keeping the projected CoM inside
+    the support polygon (following HuB's balance shaping reward, σ = 0.1 m).
+    """
 
     # Disable command-tracking rewards from locomotion-height.
     track_lin_vel_xy_exp = None
@@ -144,6 +155,46 @@ class DodgeballRewardsCfg(RewardsCfg):
     # Isaac Lab ContactSensorData in current runtime does not expose velocities_w_history.
     # Disable inherited impact-velocity term that depends on this field.
     impact_velocity = None
+
+    # Remove orientation-based penalties incompatible with extreme dodging poses.
+    flat_orientation = None
+    feet_yaw_diff = None
+    feet_yaw_mean = None
+
+    # Reduce hip deviation penalty to a soft guard (was -1.0).
+    hip_pos_pen = RewTerm(
+        func=mdp.joint_deviation_l2,
+        weight=-0.1,
+        params={
+            "robot_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=[
+                    ".*_hip_roll_joint",
+                    ".*_hip_yaw_joint",
+                ],
+            ),
+        },
+    )
+
+    # CoM balance reward — replaces flat_orientation.
+    # Returns exp(-max(dist_beyond_support, 0)^2 / sigma^2); sigma=0.1 m from HuB.
+    com_balance = RewTerm(
+        func=mdp.com_balance_reward,
+        weight=3.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll_link"),
+            "foot_asset_cfg": SceneEntityCfg("robot", body_names=".*ankle_roll_link"),
+            # Each foot is a rectangular patch on ankle_roll_link.
+            # G1 foot: ~18 cm long × 9 cm wide; ankle sits ~2 cm behind centre.
+            "foot_half_len": 0.09,      # half foot length (m)
+            "foot_half_width": 0.045,   # half foot width (m)
+            "foot_toe_offset": 0.02,    # forward shift: ankle is closer to heel
+            "sigma": 0.1,
+            "force_threshold": 10.0,
+            "grace_steps": 10,
+        },
+    )
 
     dodgeball_survival = RewTerm(func=mdp.dodgeball_survival_reward, weight=0.2)
     dodgeball_clearance = RewTerm(
@@ -166,7 +217,33 @@ class DodgeballRewardsCfg(RewardsCfg):
 
 @configclass
 class DodgeballTerminationsCfg(TerminationsCfg):
-    """Base locomotion terminations with dodgeball impact termination."""
+    """Base locomotion terminations with dodgeball impact termination.
+
+    Orientation-based terminations (base_orientation, feet_distance, knee_distance)
+    are removed so the robot is free to perform extreme in-place dodging maneuvers
+    (e.g. swallow balance with a horizontal torso or single-leg stances).  Balance
+    is instead enforced by com_outside_support_polygon, which checks the physically
+    necessary condition: the projected CoM must remain inside the support polygon.
+    """
+
+    # Remove orientation / geometry terminations that conflict with extreme poses.
+    base_orientation = None
+    feet_distance = None
+    knee_distance = None
+
+    # CoM-based balance termination — replaces base_orientation.
+    # com_outside_support_polygon = DoneTerm(
+    #     func=mdp.com_outside_support_polygon,
+    #     params={
+    #         "asset_cfg": SceneEntityCfg("robot"),
+    #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll_link"),
+    #         "foot_asset_cfg": SceneEntityCfg("robot", body_names=".*ankle_roll_link"),
+    #         "foot_width": 0.07,
+    #         "single_foot_margin": 0.05,
+    #         "double_foot_margin": 0.15,
+    #         "force_threshold": 5.0,
+    #     },
+    # )
 
     dodgeball_hit_upper_body = DoneTerm(
         func=mdp.ball_contact_protected_body,
@@ -233,6 +310,9 @@ class G1DodgeballEnvCfg(G1LowerVelocityHeightEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         self.episode_length_s = 20.0
+        # Always keep dodgeball on flat terrain for both training and evaluation.
+        self.scene.terrain.terrain_type = "plane"
+        self.scene.terrain.terrain_generator = None
         # Remove command sampling/following path for pure in-place dodgeball.
         self.commands = None
         self.curriculum = None

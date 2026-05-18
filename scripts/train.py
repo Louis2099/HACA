@@ -43,6 +43,12 @@ parser.add_argument(
     default=100,
     help="Interval between video recordings (in training iterations).",
 )
+parser.add_argument(
+    "--video_robot_env_index",
+    type=int,
+    default=0,
+    help="Index of the parallel environment to follow with the video camera and visualise (default: 0).",
+)
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
@@ -151,6 +157,12 @@ def main(
         log_dir += f"_{agent_cfg.run_name}"
     log_dir = os.path.join(log_root_path, log_dir)
 
+    # configure viewer camera to follow the selected robot environment when recording
+    if args_cli.video:
+        from dodgeball_video_utils import configure_viewer_for_video  # noqa: E402
+
+        configure_viewer_for_video(env_cfg, env_index=args_cli.video_robot_env_index)
+
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
@@ -165,8 +177,13 @@ def main(
         else:
             resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
-    # wrap for video recording
+    # wrap for video recording (overlay must be inside RecordVideo so markers
+    # are drawn before RecordVideo captures each frame)
     if args_cli.video:
+        from dodgeball_video_utils import DodgeballVideoOverlay  # noqa: E402
+
+        env = DodgeballVideoOverlay(env, env_index=args_cli.video_robot_env_index)
+
         video_interval_steps = args_cli.video_interval_iter * agent_cfg.num_steps_per_env
         video_kwargs = {
             "video_folder": os.path.join(log_dir, "videos", "train"),

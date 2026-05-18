@@ -20,9 +20,14 @@
 
 from __future__ import annotations
 
-import os, pathlib, json
+import logging
+import os
+import pathlib
+import json
 from dataclasses import asdict
 from torch.utils.tensorboard import SummaryWriter
+
+log = logging.getLogger(__name__)
 
 try:
     import wandb
@@ -98,19 +103,33 @@ class WandbSummaryWriter(SummaryWriter):
         wandb.save(path, base_path=os.path.dirname(path))
         
     def add_video_files(self, log_dir: str, step: int, fps: int = 30):
-        # Check if there are video files in the video directory
-        if os.path.exists(log_dir):
-            # append the new video files to the existing list
-            for root, dirs, files in os.walk(log_dir):
-                for video_file in files:
-                    if video_file.endswith(".mp4") and video_file not in self.video_files:
-                        self.video_files.append(video_file)
-                        # add the new video file to wandb only if video file is not updating
-                        video_path = os.path.join(root, video_file)
-                        wandb.log(
-                            {"Video": wandb.Video(video_path, fps=fps, format="mp4")},
-                            step=step
-                        )
+        """Upload newly discovered .mp4 files in log_dir to W&B.
+
+        Each file is logged under the key ``video/train_policy`` using
+        ``wandb.Video``.  Upload failures are caught and logged as warnings so
+        that training is never interrupted by W&B issues.
+        """
+        if not os.path.exists(log_dir):
+            return
+        for root, _dirs, files in os.walk(log_dir):
+            for video_file in sorted(files):
+                if not video_file.endswith(".mp4"):
+                    continue
+                if video_file in self.video_files:
+                    continue
+                self.video_files.append(video_file)
+                video_path = os.path.join(root, video_file)
+                try:
+                    wandb.log(
+                        {"video/train_policy": wandb.Video(video_path, fps=fps, format="mp4")},
+                        step=step,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "[WandbSummaryWriter] Failed to upload video %s to W&B: %s",
+                        video_path,
+                        exc,
+                    )
 
 
     """

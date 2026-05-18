@@ -180,17 +180,17 @@ def reset_dodgeball_towards_curriculum_target(
     object_asset.write_root_pose_to_sim(torch.cat([launch_pos, launch_rot], dim=-1), env_ids=env_ids)
     object_asset.write_root_velocity_to_sim(launch_vel, env_ids=env_ids)
 
-    if debug_print_world_z:
-        z_vals = launch_pos[:, 2]
-        launch_speed = torch.norm(desired_lin_vel, dim=-1)
-        below_min = int((z_vals < 1.0).sum().item())
-        print(
-            "[DODGEBALL_LAUNCH_DEBUG] "
-            f"num_envs={len(env_ids)} "
-            f"world_z_min={float(z_vals.min().item()):.4f} "
-            f"world_z_max={float(z_vals.max().item()):.4f} "
-            f"below_1p0_count={below_min} "
-            f"speed_max_limit={current_max_launch_speed:.3f} "
-            f"sampled_speed_min={float(launch_speed.min().item()):.3f} "
-            f"sampled_speed_max={float(launch_speed.max().item()):.3f}"
-        )
+    # if debug_print_world_z:
+    #     z_vals = launch_pos[:, 2]
+    #     launch_speed = torch.norm(desired_lin_vel, dim=-1)
+    #     below_min = int((z_vals < 1.0).sum().item())
+    #     print(
+    #         "[DODGEBALL_LAUNCH_DEBUG] "
+    #         f"num_envs={len(env_ids)} "
+    #         f"world_z_min={float(z_vals.min().item()):.4f} "
+    #         f"world_z_max={float(z_vals.max().item()):.4f} "
+    #         f"below_1p0_count={below_min} "
+    #         f"speed_max_limit={current_max_launch_speed:.3f} "
+    #         f"sampled_speed_min={float(launch_speed.min().item()):.3f} "
+    #         f"sampled_speed_max={float(launch_speed.max().item()):.3f}"
+    #     )

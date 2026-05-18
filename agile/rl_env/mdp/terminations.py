@@ -658,3 +658,103 @@ def ball_passed_humanoid(
 
     ball_pos_local, _ = subtract_frame_transforms(ref_pos_w, ref_quat_w, dodgeball.data.root_pos_w)
     return ball_pos_local[:, 0] < pass_x_threshold
+
+
+def com_outside_support_polygon(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),  # noqa: B008
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_forces"),  # noqa: B008
+    foot_asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),  # noqa: B008
+    foot_width: float = 0.07,
+    single_foot_margin: float = 0.05,
+    double_foot_margin: float = 0.15,
+    force_threshold: float = 5.0,
+    terminate_on_no_contact: bool = True,
+) -> torch.Tensor:
+    """Terminate if the robot's center of mass projects outside its support polygon.
+
+    This is the physically necessary and sufficient condition for quasi-static balance.
+    It replaces orientation-based terminations, allowing extreme maneuvers (e.g. swallow
+    balance with a horizontal torso) as long as the CoM remains above the support area.
+
+    The support polygon is approximated as:
+    - Two feet in contact: nearest point on the line segment between the two ankle positions.
+    - One foot in contact: the ankle position itself (support degenerates to a point).
+    - No contact: treated as outside (terminates if ``terminate_on_no_contact`` is True).
+
+    An effective foot-patch radius (``foot_width``) is subtracted so the CoM is allowed
+    to be up to ``foot_width`` beyond the ankle-centre before the margin kicks in.
+
+    Args:
+        env: The environment instance.
+        asset_cfg: Robot asset config with no body_names restriction — used to access all
+            body masses and positions for CoM computation.
+        sensor_cfg: Contact sensor config filtered to the foot bodies (ankle_roll_link).
+        foot_asset_cfg: Robot asset config with body_names matching the feet, used to
+            obtain world-frame foot XY positions.
+        foot_width: Effective contact-patch half-width (m).  Distance from CoM to the
+            support polygon is reduced by this before comparing against the margin.
+        single_foot_margin: Extra distance (m) tolerated when only one foot is in contact.
+        double_foot_margin: Extra distance (m) tolerated when both feet are in contact.
+        force_threshold: Minimum contact force (N) to consider a foot as grounded.
+        terminate_on_no_contact: If True, terminate whenever no foot is in contact.
+
+    Returns:
+        Boolean tensor [num_envs] — True for environments that should terminate.
+    """
+    robot: Articulation = env.scene[asset_cfg.name]
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+
+    # --- 1. Compute centre-of-mass XY projection ---
+    # default_mass is populated at load time and lives on CPU; move it to the
+    # simulation device so it can be multiplied with body_pos_w (on CUDA).
+    masses = robot.data.default_mass.to(env.device)  # [N, B]
+    total_mass = masses.sum(dim=1, keepdim=True).clamp_min(1e-6)  # [N, 1]
+    body_pos_xy = robot.data.body_pos_w[:, :, :2]  # [N, B, 2]
+    com_xy = (masses.unsqueeze(-1) * body_pos_xy).sum(dim=1) / total_mass  # [N, 2]
+
+    # --- 2. Foot contact state ---
+    foot_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]  # [N, 2, 3]
+    foot_in_contact = torch.norm(foot_forces, dim=-1) > force_threshold  # [N, 2]
+    n_contacts = foot_in_contact.sum(dim=1)  # [N]
+
+    # --- 3. Foot positions (XY) ---
+    foot_pos_xy = robot.data.body_pos_w[:, foot_asset_cfg.body_ids, :2]  # [N, 2, 2]
+    A = foot_pos_xy[:, 0]  # left ankle  [N, 2]
+    B = foot_pos_xy[:, 1]  # right ankle [N, 2]
+
+    # Distance to line-segment AB (two-foot support polygon approximation)
+    AB = B - A  # [N, 2]
+    AP = com_xy - A  # [N, 2]
+    ab_sq = (AB * AB).sum(dim=-1).clamp_min(1e-6)  # [N]
+    t = torch.clamp((AP * AB).sum(dim=-1) / ab_sq, 0.0, 1.0)  # [N]
+    closest_on_segment = A + t.unsqueeze(-1) * AB  # [N, 2]
+    dist_two_foot = torch.norm(com_xy - closest_on_segment, dim=-1)  # [N]
+
+    # Distance to individual foot positions (single-foot support)
+    dist_left = torch.norm(com_xy - A, dim=-1)   # [N]
+    dist_right = torch.norm(com_xy - B, dim=-1)  # [N]
+
+    # --- 4. Select distance and margin based on contact state ---
+    left_contact = foot_in_contact[:, 0]
+    right_contact = foot_in_contact[:, 1]
+    both_contact = n_contacts >= 2
+
+    # Raw distance to support polygon
+    dist = torch.where(
+        both_contact,
+        dist_two_foot,
+        torch.where(left_contact, dist_left, dist_right),
+    )
+
+    # Subtract effective foot-patch radius to get the distance *beyond* the polygon
+    dist_beyond = torch.clamp(dist - foot_width, min=0.0)
+
+    # Allowed slack depends on number of feet in contact
+    margin = torch.where(both_contact, double_foot_margin, single_foot_margin)
+
+    outside = dist_beyond > margin
+
+    if terminate_on_no_contact:
+        return outside | (n_contacts == 0)
+    return outside

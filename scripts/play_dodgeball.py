@@ -53,6 +53,12 @@ parser.add_argument(
 )
 parser.add_argument("--video", action="store_true", default=False, help="Record one video.")
 parser.add_argument("--video_length", type=int, default=600, help="Recorded video length.")
+parser.add_argument(
+    "--video_robot_env_index",
+    type=int,
+    default=0,
+    help="Index of the parallel environment to follow with the video camera and visualise (default: 0).",
+)
 parser.add_argument("--disable_fabric", action="store_true", default=False, help="Disable fabric.")
 parser.add_argument(
     "--follow_robot_camera",
@@ -101,6 +107,7 @@ from isaaclab.utils.dict import print_dict  # noqa: E402
 
 import agile.rl_env.tasks  # noqa: F401, E402
 from dodgeball_plot_utils import DodgeballTrajectoryPlotter  # noqa: E402
+from dodgeball_video_utils import DodgeballVideoOverlay, configure_viewer_for_video  # noqa: E402
 
 
 def _prepare_env_cfg(env_cfg: ManagerBasedRLEnvCfg) -> ManagerBasedRLEnvCfg:
@@ -144,9 +151,11 @@ def _prepare_env_cfg(env_cfg: ManagerBasedRLEnvCfg) -> ManagerBasedRLEnvCfg:
         if hasattr(env_cfg.scene.robot, "spawn") and hasattr(env_cfg.scene.robot.spawn, "articulation_props"):
             env_cfg.scene.robot.spawn.articulation_props.fix_root_link = True
 
-    # Prevent camera snap-back each frame by default.
-    # IsaacLab's viewport controller continuously updates camera for asset_root/body origin types.
-    if not args_cli.follow_robot_camera and hasattr(env_cfg, "viewer") and env_cfg.viewer is not None:
+    # When recording video, configure the camera to follow the selected robot.
+    # Otherwise respect --follow_robot_camera (disable snap-back by defaulting to world origin).
+    if args_cli.video:
+        configure_viewer_for_video(env_cfg, env_index=args_cli.video_robot_env_index)
+    elif not args_cli.follow_robot_camera and hasattr(env_cfg, "viewer") and env_cfg.viewer is not None:
         env_cfg.viewer.origin_type = "world"
     return env_cfg
 
@@ -226,6 +235,135 @@ def _get_ball_in_humanoid_frame(env: ManagerBasedRLEnv) -> torch.Tensor:
     return ball_pos_local
 
 
+def _print_com_diag(env: ManagerBasedRLEnv, timestep: int, env_idx: int = 0) -> None:
+    """Print a one-line diagnostics row for env_idx (first 50 steps only).
+
+    Shows foot-patch corners, support-polygon hull area, and distance from the
+    CoM projection to the hull — matching the reward computation exactly.
+    """
+    base_env = env.unwrapped
+    if not hasattr(base_env, "scene"):
+        return
+    try:
+        robot = base_env.scene["robot"]
+    except KeyError:
+        return
+    try:
+        contact_sensor = base_env.scene["contact_forces"]
+    except KeyError:
+        contact_sensor = None
+
+    FORCE_THRESHOLD  = 10.0
+    FOOT_HALF_LEN    = 0.09
+    FOOT_HALF_WIDTH  = 0.045
+    FOOT_TOE_OFFSET  = 0.02   # ankle sits ~2 cm behind foot centre
+    SIGMA            = 0.1
+
+    device = base_env.device
+    idx = env_idx
+
+    root_z   = float(robot.data.root_pos_w[idx, 2].item())
+    body_pos_w = robot.data.body_pos_w[idx]                     # [B, 3]
+    lowest_z = float(body_pos_w[:, 2].min().item())
+
+    # CoM
+    masses     = robot.data.default_mass.to(device)             # [N, B]
+    total_mass = float(masses[idx].sum().clamp_min(1e-6).item())
+    com_xyz    = (masses[idx].unsqueeze(-1) * body_pos_w).sum(0) / total_mass
+    com        = com_xyz.cpu().numpy()                          # [3]
+
+    # Collect grounded foot patches (same logic as DodgeballVideoOverlay)
+    foot_patches: list[tuple[np.ndarray, np.ndarray, float]] = []
+    # Each entry: (ankle_xy [2], patch_corners [4,2], force_N)
+    if contact_sensor is not None:
+        try:
+            s_names = contact_sensor.body_names
+            robot_ids, _ = robot.find_bodies(s_names, preserve_order=True)
+        except Exception:
+            robot_ids = list(range(contact_sensor.num_bodies))
+        forces_w    = contact_sensor.data.net_forces_w          # [N, C, 3]
+        force_norms = torch.norm(forces_w[idx], dim=-1)         # [C]
+        body_quat_w = robot.data.body_quat_w                    # [N, B, 4]
+        for local_i, robot_body_id in enumerate(robot_ids):
+            if local_i >= force_norms.shape[0]:
+                break
+            fn = float(force_norms[local_i].item())
+            if fn > FORCE_THRESHOLD:
+                bp = robot.data.body_pos_w[idx, robot_body_id]
+                bq = body_quat_w[idx, robot_body_id]
+                ankle_xy = np.array([float(bp[0].item()), float(bp[1].item())], dtype=np.float32)
+                q = np.array([float(bq[0].item()), float(bq[1].item()),
+                               float(bq[2].item()), float(bq[3].item())], dtype=np.float32)
+                yaw = float(np.arctan2(2.0 * (q[0]*q[3] + q[1]*q[2]),
+                                       1.0 - 2.0 * (q[2]**2 + q[3]**2)))
+                toe  = FOOT_HALF_LEN + FOOT_TOE_OFFSET
+                heel = FOOT_HALF_LEN - FOOT_TOE_OFFSET
+                patch = np.array([
+                    [ toe,   FOOT_HALF_WIDTH],
+                    [ toe,  -FOOT_HALF_WIDTH],
+                    [-heel, -FOOT_HALF_WIDTH],
+                    [-heel,  FOOT_HALF_WIDTH],
+                ], dtype=np.float32)
+                cos_y, sin_y = float(np.cos(yaw)), float(np.sin(yaw))
+                rot = np.array([[cos_y, -sin_y], [sin_y, cos_y]], dtype=np.float32)
+                corners = ankle_xy + patch @ rot.T
+                foot_patches.append((ankle_xy, corners, fn))
+
+    n_feet = len(foot_patches)
+
+    # Support polygon hull + distance + reward estimate
+    if n_feet > 0:
+        from scripts.dodgeball_video_utils import _convex_hull_2d  # type: ignore
+        all_corners = np.vstack([fp[1] for fp in foot_patches])    # [4n, 2]
+        hull_verts  = _convex_hull_2d(all_corners)
+        n_hull      = len(hull_verts)
+        # Shoelace area
+        area = 0.5 * abs(
+            sum(hull_verts[i, 0] * hull_verts[(i+1) % n_hull, 1]
+                - hull_verts[(i+1) % n_hull, 0] * hull_verts[i, 1]
+                for i in range(n_hull))
+        )
+        # Inside test + min boundary distance
+        inside = all(
+            (hull_verts[(i+1) % n_hull] - hull_verts[i])[0] *
+            (com[:2] - hull_verts[i])[1] -
+            (hull_verts[(i+1) % n_hull] - hull_verts[i])[1] *
+            (com[:2] - hull_verts[i])[0] >= -1e-6
+            for i in range(n_hull)
+        )
+        if inside:
+            sp_dist = 0.0
+        else:
+            sp_dist = float("inf")
+            for i in range(n_hull):
+                j = (i + 1) % n_hull
+                ab = hull_verts[j] - hull_verts[i]
+                t  = float(np.clip(np.dot(com[:2] - hull_verts[i], ab) /
+                                   (np.dot(ab, ab) + 1e-8), 0, 1))
+                sp_dist = min(sp_dist, float(np.linalg.norm(com[:2] - (hull_verts[i] + t * ab))))
+
+        rew = float(np.exp(-(sp_dist ** 2) / (SIGMA ** 2)))
+        ct_str = " ".join(
+            f"({ax:.2f},{ay:.2f},F={fn:.0f}N)"
+            for ax, ay, fn in [(fp[0][0], fp[0][1], fp[2]) for fp in foot_patches]
+        )
+        print(
+            f"[COM_DIAG t={timestep:3d}]"
+            f"  root_z={root_z:.3f}  low_z={lowest_z:.3f}"
+            f"  com=({com[0]:.3f},{com[1]:.3f},{com[2]:.3f})"
+            f"  n_feet={n_feet}  hull_pts={n_hull}  area={area:.4f}m²"
+            f"  sp_dist={sp_dist:.3f}m  com_rew~{rew:.3f}"
+            f"  contacts=[{ct_str}]"
+        )
+    else:
+        print(
+            f"[COM_DIAG t={timestep:3d}]"
+            f"  root_z={root_z:.3f}  low_z={lowest_z:.3f}"
+            f"  com=({com[0]:.3f},{com[1]:.3f},{com[2]:.3f})"
+            f"  n_feet=0  sp_dist=infm  com_rew~0.000"
+        )
+
+
 def _get_humanoid_reference_height(env: ManagerBasedRLEnv) -> float:
     robot = env.unwrapped.scene["robot"]
     try:
@@ -256,6 +394,10 @@ def main():
     env = ManagerBasedRLEnv(env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
     if args_cli.video:
+        # Overlay wrapper must be inside RecordVideo so markers are drawn before
+        # RecordVideo captures the viewport frame.
+        env = DodgeballVideoOverlay(env, env_index=args_cli.video_robot_env_index)
+
         video_dir = os.path.abspath(os.path.join("logs", "videos", "play_dodgeball"))
         video_kwargs = {
             "video_folder": video_dir,
@@ -319,9 +461,13 @@ def main():
                 else:
                     actions = args_cli.action_scale * (2.0 * torch.rand(num_envs, action_dim, device=device) - 1.0)
 
-                obs, _, terminated, truncated, _ = env.step(actions)
+                obs, _, terminated, truncated, info = env.step(actions)
                 if args_cli.freeze_robot:
                     _enforce_freeze_state(env, freeze_state)
+
+                # Per-step COM/support-polygon diagnostics for the first 50 steps
+                if timestep < 50:
+                    _print_com_diag(env, timestep, env_idx=args_cli.video_robot_env_index)
 
                 if traj_plotter is not None:
                     rel_pos_local = _get_ball_in_humanoid_frame(env).detach().cpu().numpy()
