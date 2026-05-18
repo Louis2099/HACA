@@ -40,6 +40,7 @@ from rsl_rl.modules import (
     StudentTrainedTeacherRecurrent,
 )
 from rsl_rl.utils import store_code_state
+from agile.rl_env.rsl_rl.cbf import CBFActionFilter
 
 
 class OnPolicyRunner:
@@ -51,6 +52,8 @@ class OnPolicyRunner:
         self.policy_cfg = train_cfg["policy"]
         self.device = device
         self.env = env
+        cbf_cfg = self.cfg.get("cbf_cfg", None)
+        self.cbf_filter = CBFActionFilter(cbf_cfg) if cbf_cfg is not None else None
 
         # check if multi-gpu is enabled
         self._configure_multi_gpu()
@@ -237,6 +240,9 @@ class OnPolicyRunner:
         lenbuffer = deque(maxlen=100)
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        cbf_violation_buffer = deque(maxlen=100)
+        cbf_projection_buffer = deque(maxlen=100)
+        cbf_safe_ratio_buffer = deque(maxlen=100)
 
         # create buffers for logging extrinsic and intrinsic rewards
         if self.alg.rnd:
@@ -268,8 +274,18 @@ class OnPolicyRunner:
                 for _ in range(self.num_steps_per_env):
                     # Sample actions
                     actions = self.alg.act(obs, privileged_obs)
+                    cbf_stats = None
+                    if self.cbf_filter is not None and self.cbf_filter.enabled:
+                        actions, cbf_stats = self.cbf_filter.filter_actions(obs, actions)
+                        if hasattr(self.alg, "apply_action_filter"):
+                            self.alg.apply_action_filter(actions, cbf_stats)
                     # Step the environment
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+                    if cbf_stats is not None:
+                        infos.update(cbf_stats)
+                        cbf_violation_buffer.append(float(cbf_stats["cbf_violation"].mean().item()))
+                        cbf_projection_buffer.append(float(cbf_stats["cbf_projection_norm"].mean().item()))
+                        cbf_safe_ratio_buffer.append(float(cbf_stats["cbf_safe_action_ratio"].mean().item()))
                     # Move to device
                     obs, rewards, dones = (
                         obs.to(self.device),
@@ -407,6 +423,18 @@ class OnPolicyRunner:
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
         self.writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
         self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
+        if len(locs["cbf_violation_buffer"]) > 0:
+            self.writer.add_scalar("Train/cbf_violation_rate", statistics.mean(locs["cbf_violation_buffer"]), locs["it"])
+            self.writer.add_scalar(
+                "Train/cbf_avg_projection_norm",
+                statistics.mean(locs["cbf_projection_buffer"]),
+                locs["it"],
+            )
+            self.writer.add_scalar(
+                "Train/cbf_safe_action_ratio",
+                statistics.mean(locs["cbf_safe_ratio_buffer"]),
+                locs["it"],
+            )
 
         # -- Training
         if len(locs["rewbuffer"]) > 0:
@@ -479,6 +507,12 @@ class OnPolicyRunner:
             log_string += f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
             # -- episode info
             log_string += f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
+            if len(locs["cbf_violation_buffer"]) > 0:
+                log_string += f"""{'CBF violation rate:':>{pad}} {statistics.mean(locs['cbf_violation_buffer']):.4f}\n"""
+                log_string += (
+                    f"""{'CBF avg projection norm:':>{pad}} {statistics.mean(locs['cbf_projection_buffer']):.4f}\n"""
+                )
+                log_string += f"""{'CBF safe action ratio:':>{pad}} {statistics.mean(locs['cbf_safe_ratio_buffer']):.4f}\n"""
         else:
             log_string = (
                 f"""{'#' * width}\n"""

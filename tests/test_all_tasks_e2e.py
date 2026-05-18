@@ -102,6 +102,8 @@ class TestAllTasks(unittest.TestCase):
             "HeightTracking-G1-v0",
             # G1 Robot - Pick and Place - Tracking
             "G1-PickPlace-Tracking-v0",
+            # G1 Robot - Dodgeball with CBF-RL safety filtering
+            "Dodgeball-G1-v0",
             # ====================================================================
             # 🆕 ADD YOUR NEW TASKS HERE!
             # ====================================================================

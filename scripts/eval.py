@@ -20,6 +20,12 @@
 # flake8: noqa
 
 import argparse
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from isaaclab.app import AppLauncher
 
@@ -178,6 +184,7 @@ from rsl_rl.runners import OnPolicyRunner
 from agile.algorithms.evaluation.evaluator import PolicyEvaluator
 from agile.rl_env.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
 from agile.rl_env.rsl_rl import export_policy_as_jit, export_policy_as_onnx
+from agile.rl_env.rsl_rl.cbf import CBFActionFilter
 
 
 def _apply_env_overrides(env_cfg, eval_config):
@@ -394,6 +401,7 @@ def main():
 
     # Load policy (supports both TorchScript and regular checkpoints)
     policy, ppo_runner = load_policy(resume_path, env, agent_cfg)
+    cbf_filter = CBFActionFilter(agent_cfg.cbf_cfg.to_dict()) if getattr(agent_cfg, "cbf_cfg", None) else None
 
     # Export policy to onnx/jit if we loaded from a regular checkpoint
     # (Skip if already TorchScript or if export fails)
@@ -611,6 +619,8 @@ def main():
 
             # agent stepping
             actions = policy(obs_tensor)
+            if cbf_filter is not None and cbf_filter.enabled:
+                actions, _ = cbf_filter.filter_actions(obs, actions)
             # env stepping
             obs, _, dones, extras = env.step(actions)
 

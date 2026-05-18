@@ -66,6 +66,9 @@ class PPO:
         l2c2_cfg: dict | None = None,
         # Reward normalization parameters
         reward_normalization_cfg: dict | None = None,
+        # CBF regularization parameters
+        cbf_safe_action_loss_coef: float = 0.0,
+        cbf_reward_penalty_coef: float = 0.0,
     ):
         # device-related parameters
         self.device = device
@@ -156,6 +159,8 @@ class PPO:
         self.schedule = schedule
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
+        self.cbf_safe_action_loss_coef = cbf_safe_action_loss_coef
+        self.cbf_reward_penalty_coef = cbf_reward_penalty_coef
 
         # Critic warmup
         self.critic_warmup_steps = critic_warmup_steps
@@ -254,6 +259,10 @@ class PPO:
             )
             self.transition.rewards += good_sigma
 
+        if self.cbf_reward_penalty_coef > 0.0 and "cbf_projection_norm" in infos:
+            cbf_penalty = infos["cbf_projection_norm"].to(self.device)
+            self.transition.rewards -= self.cbf_reward_penalty_coef * cbf_penalty
+
         # record the transition
         self.storage.add_transitions(self.transition)
         self.transition.clear()
@@ -271,6 +280,13 @@ class PPO:
         # Update the return-scale correction to account for temporal reward correlation
         if self.reward_normalizer is not None:
             self.reward_normalizer.update_return_scale(self.storage.returns)
+
+    def apply_action_filter(self, safe_actions: torch.Tensor, filter_stats: dict[str, torch.Tensor] | None = None):
+        """Replace the transition action with the filtered action before env.step."""
+        self.transition.actions = safe_actions.detach()
+        self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
+        self.transition.action_mean = self.policy.action_mean.detach()
+        self.transition.action_sigma = self.policy.action_std.detach()
 
     def update(self):  # noqa: C901
         mean_value_loss = 0
@@ -293,6 +309,10 @@ class PPO:
         else:
             mean_l2c2_actor_loss = None
             mean_l2c2_critic_loss = None
+        if self.cbf_safe_action_loss_coef > 0.0:
+            mean_cbf_safe_action_loss = 0
+        else:
+            mean_cbf_safe_action_loss = None
 
         # generator for mini batches
         if self.policy.is_recurrent:
@@ -440,6 +460,10 @@ class PPO:
             else:
                 loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
+            if self.cbf_safe_action_loss_coef > 0.0:
+                cbf_safe_action_loss = torch.mean(torch.square(mu_batch - actions_batch.detach()))
+                loss += self.cbf_safe_action_loss_coef * cbf_safe_action_loss
+
             if loss.abs().max() > 1000.0 or loss.isnan().any():
                 print(f"Loss is greater than 1000: {loss.mean()}")
                 print(f"Surrogate loss: {surrogate_loss.mean()}")
@@ -560,6 +584,8 @@ class PPO:
             if mean_l2c2_actor_loss is not None:
                 mean_l2c2_actor_loss += l2c2_actor_loss.item()
                 mean_l2c2_critic_loss += l2c2_critic_loss.item()
+            if mean_cbf_safe_action_loss is not None:
+                mean_cbf_safe_action_loss += cbf_safe_action_loss.item()
         # -- For PPO
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
@@ -575,6 +601,8 @@ class PPO:
         if mean_l2c2_actor_loss is not None:
             mean_l2c2_actor_loss /= num_updates
             mean_l2c2_critic_loss /= num_updates
+        if mean_cbf_safe_action_loss is not None:
+            mean_cbf_safe_action_loss /= num_updates
         # -- Clear the storage
         self.storage.clear()
 
@@ -591,6 +619,8 @@ class PPO:
         if self.use_l2c2:
             loss_dict["l2c2_actor"] = mean_l2c2_actor_loss
             loss_dict["l2c2_critic"] = mean_l2c2_critic_loss
+        if mean_cbf_safe_action_loss is not None:
+            loss_dict["cbf_safe_action"] = mean_cbf_safe_action_loss
         return loss_dict
 
     """

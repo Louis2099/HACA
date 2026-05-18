@@ -13,10 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from . import debug, locomotion, locomotion_height, pick_place, stand_up, tracking
+from . import debug, dodgeball, locomotion, locomotion_height, pick_place, stand_up, tracking
 
 __all__ = [
     "debug",
+    "dodgeball",
     "locomotion",
     "locomotion_height",
     "pick_place",

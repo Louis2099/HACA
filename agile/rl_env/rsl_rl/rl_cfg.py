@@ -148,6 +148,41 @@ class RslRlPpoAlgorithmCfg:
     reward_normalization_cfg: RslRlRewardNormalizationCfg | None = None
     """Configuration for reward normalization. Default is None (disabled)."""
 
+    cbf_safe_action_loss_coef: float = 0.0
+    """Auxiliary loss coefficient to match policy mean with CBF-filtered actions."""
+
+    cbf_reward_penalty_coef: float = 0.0
+    """Penalty coefficient applied to CBF projection norm during rollout reward processing."""
+
+
+@configclass
+class RslRlCbfCfg:
+    """Configuration for online CBF-style action filtering."""
+
+    enabled: bool = False
+    """Enable CBF safety filtering when true."""
+
+    observation_pos_key: str = "ball_pos_rel_root"
+    """Observation key containing relative obstacle position in root/body frame."""
+
+    observation_vel_key: str = "ball_vel_rel_root"
+    """Observation key containing relative obstacle velocity in root/body frame."""
+
+    safe_distance: float = 0.6
+    """Safety shell radius around the robot root in meters."""
+
+    reaction_time: float = 0.25
+    """Time-horizon for velocity-aware barrier tightening in seconds."""
+
+    projection_gain: float = 1.0
+    """Gain mapping barrier violation to action correction magnitude."""
+
+    max_projection_norm: float = 0.5
+    """Maximum L2-norm of the corrective action projection."""
+
+    action_clip: float | None = None
+    """Optional absolute clamp on each action dimension after filtering."""
+
 
 #########################
 # Runner configurations #
@@ -244,3 +279,6 @@ class RslRlOnPolicyRunnerCfg:
 
     load_optimizer: bool = True
     """Whether to load the optimizer. Default is True."""
+
+    cbf_cfg: RslRlCbfCfg | None = None
+    """Optional CBF filter configuration. If None, CBF filtering is disabled."""

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .dodgeball_events import *  # noqa: F401, F403
 from .events import *  # noqa: F401, F403
 from .fallen_state_cache import (  # noqa: F401
     compute_fallen_state_cache_key,

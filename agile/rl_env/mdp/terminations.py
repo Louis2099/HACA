@@ -584,3 +584,77 @@ def out_of_bound(
     # Check if object is outside bounds
     outside_bounds = ((object_pos_local < ranges[:, 0]) | (object_pos_local > ranges[:, 1])).any(dim=1)
     return outside_bounds
+
+
+def ball_hit_protected_body(
+    env: ManagerBasedRLEnv,
+    object_cfg: SceneEntityCfg = SceneEntityCfg("dodgeball"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    distance_threshold: float = 0.28,
+) -> torch.Tensor:
+    """Terminate if the dodgeball gets too close to protected robot bodies."""
+    dodgeball: RigidObject = env.scene[object_cfg.name]
+    robot: Articulation = env.scene[asset_cfg.name]
+
+    ball_pos_w = dodgeball.data.root_pos_w
+    if asset_cfg.body_ids is None or len(asset_cfg.body_ids) == 0:
+        protected_pos_w = robot.data.root_pos_w.unsqueeze(1)
+    else:
+        protected_pos_w = robot.data.body_pos_w[:, asset_cfg.body_ids, :]
+
+    distances = torch.norm(protected_pos_w - ball_pos_w.unsqueeze(1), dim=-1)
+    return torch.any(distances < distance_threshold, dim=1)
+
+
+def ball_contact_protected_body(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("dodgeball_robot_contact"),
+    force_threshold: float = 2.0,
+) -> torch.Tensor:
+    """Terminate if dodgeball receives robot contact force above threshold.
+
+    The contact sensor is attached to the ball and filtered to robot prims, so this
+    condition is robust to long-link geometry and avoids ground-contact false positives.
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    net_contact_forces = contact_sensor.data.net_forces_w_history
+
+    # Ball has a single rigid body in this setup; keep generic indexing fallback.
+    body_ids = sensor_cfg.body_ids
+    if body_ids is None:
+        body_force_norm = torch.norm(net_contact_forces, dim=-1)  # [N, history, bodies]
+    elif isinstance(body_ids, slice):
+        body_force_norm = torch.norm(net_contact_forces[:, :, body_ids], dim=-1)
+    else:
+        if len(body_ids) == 0:
+            body_force_norm = torch.norm(net_contact_forces, dim=-1)
+        else:
+            body_force_norm = torch.norm(net_contact_forces[:, :, body_ids], dim=-1)
+
+    max_force_over_history = torch.max(body_force_norm, dim=1)[0]
+    if max_force_over_history.ndim == 1:
+        return max_force_over_history > force_threshold
+    return torch.any(max_force_over_history > force_threshold, dim=1)
+
+
+def ball_passed_humanoid(
+    env: ManagerBasedRLEnv,
+    object_cfg: SceneEntityCfg = SceneEntityCfg("dodgeball"),
+    reference_asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=["torso_link"]),
+    pass_x_threshold: float = -0.15,
+) -> torch.Tensor:
+    """Terminate if the dodgeball has passed the humanoid in torso local x-axis."""
+    dodgeball: RigidObject = env.scene[object_cfg.name]
+    robot: Articulation = env.scene[reference_asset_cfg.name]
+
+    body_ids = reference_asset_cfg.body_ids
+    if body_ids is None or len(body_ids) == 0:
+        ref_pos_w = robot.data.root_pos_w
+        ref_quat_w = robot.data.root_quat_w
+    else:
+        ref_body_id = int(body_ids[0])
+        ref_pos_w = robot.data.body_pos_w[:, ref_body_id, :]
+        ref_quat_w = robot.data.body_quat_w[:, ref_body_id, :]
+
+    ball_pos_local, _ = subtract_frame_transforms(ref_pos_w, ref_quat_w, dodgeball.data.root_pos_w)
+    return ball_pos_local[:, 0] < pass_x_threshold

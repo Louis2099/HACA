@@ -40,6 +40,12 @@ parser.add_argument("--num_steps", type=int, default=0, help="Number of steps to
 parser.add_argument("--disable_fabric", action="store_true", default=False, help="Disable Fabric (use USD I/O).")
 parser.add_argument("--real-time", action="store_true", default=False, help="Run close to real-time if possible.")
 parser.add_argument(
+    "--follow_robot_camera",
+    action="store_true",
+    default=False,
+    help="Keep IsaacLab camera follow mode (asset_root). Off by default to allow manual camera control.",
+)
+parser.add_argument(
     "--validate-fallen-states",
     action="store_true",
     default=False,
@@ -88,6 +94,11 @@ def prepare_env_for_playing(env_cfg: ManagerBasedRLEnvCfg) -> ManagerBasedRLEnvC
     # Remove random upper body motion
     if hasattr(env_cfg.actions, "random_pos"):
         del env_cfg.actions.random_pos
+
+    # Prevent camera snap-back each frame by default.
+    # IsaacLab's viewport controller continuously updates camera for asset_root/body origin types.
+    if not args_cli.follow_robot_camera and hasattr(env_cfg, "viewer") and env_cfg.viewer is not None:
+        env_cfg.viewer.origin_type = "world"
 
     return env_cfg
 

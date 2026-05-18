@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .dodgeball_observations import *  # noqa: F401, F403
 from .motion_tracking_observations import *  # noqa: F401, F403
 from .observations_cfg import *  # noqa: F401, F403
 from .observations_io import *  # noqa: F401, F403
