@@ -279,3 +279,93 @@ def com_balance_reward(
     reward = torch.where(n_contacts == 0, torch.zeros_like(reward), reward)
     reward = torch.where(in_grace,        torch.ones_like(reward),  reward)
     return reward
+
+
+def foot_locomotion_penalty(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_forces"),  # noqa: B008
+    foot_asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),        # noqa: B008
+    force_threshold: float = 10.0,
+    foot_vel_threshold: float = 0.15,
+    both_moving_scale: float = 1.0,
+    one_moving_scale: float = 0.2,
+    drift_scale: float = 0.5,
+    drift_clip: float = 2.0,
+    grace_steps: int = 10,
+) -> torch.Tensor:
+    """Penalise locomotion/displacement without penalising valid balance footwork.
+
+    Approach — each foot is classified each step as *planted* or *moving*:
+    - **Planted**: in contact (normal force > ``force_threshold``) AND horizontal
+      speed < ``foot_vel_threshold``.
+    - **Moving**: everything else.
+
+    Penalty contributions:
+    1. **Both feet moving** (locomotion): ``both_moving_scale × mean_foot_speed``.
+    2. **One foot moving** (corrective step): ``one_moving_scale × mean_foot_speed``.
+    3. **Stance-centre drift**: slow drift of the mean foot XY position away from
+       the episode-start anchor.  Catches gradual walking that alternates planted
+       feet.  ``drift_scale × clamp(drift, 0, drift_clip)``.
+
+    The penalty is zero during the ``grace_steps`` post-reset settling window.
+    The stance anchor ``env._stance_anchor_w`` is initialised at the first step
+    of each episode.
+
+    Returns:
+        Penalty tensor shape [num_envs], values ≥ 0.  Apply a negative weight
+        in the ``RewTerm`` to convert to a negative reward.
+    """
+    robot: Articulation = env.scene[foot_asset_cfg.name]
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+
+    # Grace period — contacts not yet established.
+    in_grace = env.episode_length_buf < grace_steps  # [N]
+    if in_grace.all():
+        return torch.zeros(env.num_envs, device=env.device)
+
+    # ── Foot positions and velocities ─────────────────────────────────────────
+    foot_pos_w  = robot.data.body_pos_w[:, foot_asset_cfg.body_ids, :]  # [N, F, 3]
+    foot_vel_w  = robot.data.body_vel_w[:, foot_asset_cfg.body_ids, :3] # [N, F, 3]
+    foot_xy     = foot_pos_w[..., :2]                                    # [N, F, 2]
+    mean_foot_xy = foot_xy.mean(dim=1)                                   # [N, 2]
+
+    # ── Stance anchor: reset at first step of each episode ────────────────────
+    if not hasattr(env, "_stance_anchor_w") or env._stance_anchor_w.shape[0] != env.num_envs:
+        env._stance_anchor_w = mean_foot_xy.clone()
+
+    just_reset = env.episode_length_buf == 1  # [N]
+    if just_reset.any():
+        env._stance_anchor_w = env._stance_anchor_w.clone()
+        env._stance_anchor_w[just_reset] = mean_foot_xy[just_reset]
+
+    # ── Planted / moving classification ───────────────────────────────────────
+    foot_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]  # [N, F, 3]
+    in_contact  = torch.norm(foot_forces, dim=-1) > force_threshold             # [N, F]
+
+    # Horizontal (XY) foot speed.
+    foot_speed_h = torch.norm(foot_vel_w[..., :2], dim=-1)   # [N, F]
+    is_slow      = foot_speed_h < foot_vel_threshold          # [N, F]
+
+    planted = in_contact & is_slow    # [N, F]
+    moving  = ~planted                # [N, F]
+    n_moving = moving.sum(dim=1)      # [N]   0 / 1 / 2
+
+    mean_speed = foot_speed_h.mean(dim=1)  # [N]
+
+    both_moving_mask = n_moving >= 2   # [N]
+    one_moving_mask  = n_moving == 1   # [N]
+
+    locomotion_penalty = torch.where(
+        both_moving_mask,
+        both_moving_scale * mean_speed,
+        torch.where(one_moving_mask, one_moving_scale * mean_speed, torch.zeros_like(mean_speed)),
+    )
+
+    # ── Stance-centre drift penalty ────────────────────────────────────────────
+    drift = torch.norm(mean_foot_xy - env._stance_anchor_w, dim=-1)  # [N]
+    drift_penalty = drift_scale * drift.clamp(max=drift_clip)
+
+    # ── Combine, zero out grace steps ─────────────────────────────────────────
+    penalty = locomotion_penalty + drift_penalty
+    penalty = torch.where(in_grace, torch.zeros_like(penalty), penalty)
+    return penalty
