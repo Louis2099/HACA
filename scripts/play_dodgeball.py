@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import pickle
 import time
 from pathlib import Path
 import sys
@@ -31,13 +32,30 @@ import torch
 
 from isaaclab.app import AppLauncher
 
+import cli_args  # isort: skip
 
-parser = argparse.ArgumentParser(description="Play Dodgeball-G1 environment without a policy checkpoint.")
+
+parser = argparse.ArgumentParser(description="Play Dodgeball-G1 environment with scripted actions or a policy.")
 parser.add_argument("--task", type=str, default="Dodgeball-G1-v0", help="Gym task id to run.")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments.")
 parser.add_argument("--num_steps", type=int, default=3000, help="Number of steps to run (0 = unlimited).")
-parser.add_argument("--mode", type=str, default="zero", choices=["zero", "sine", "random"], help="Action source.")
+parser.add_argument(
+    "--mode",
+    type=str,
+    default="zero",
+    choices=["zero", "sine", "random", "policy"],
+    help="Action source. Use 'policy' with --checkpoint or --policy_path.",
+)
 parser.add_argument("--action_scale", type=float, default=0.25, help="Scale for sine/random actions.")
+parser.add_argument(
+    "--ball_speed",
+    type=float,
+    default=None,
+    help=(
+        "Optional fixed dodgeball launch speed in m/s for testing. "
+        "If omitted, playback uses the current randomized stage/legacy speed behavior."
+    ),
+)
 parser.add_argument("--real_time", action="store_true", default=False, help="Attempt real-time stepping.")
 parser.add_argument(
     "--freeze-robot",
@@ -49,10 +67,19 @@ parser.add_argument(
     "--policy_path",
     type=str,
     default=None,
-    help="Optional TorchScript policy path. Used when --freeze-robot is disabled.",
+    help=(
+        "Optional policy file. Supports exported TorchScript policies and regular RSL-RL checkpoints. "
+        "Equivalent to --checkpoint when a regular checkpoint is supplied."
+    ),
 )
 parser.add_argument("--video", action="store_true", default=False, help="Record one video.")
 parser.add_argument("--video_length", type=int, default=600, help="Recorded video length.")
+parser.add_argument(
+    "--video_dir",
+    type=str,
+    default=None,
+    help="Directory for recorded videos. Defaults to logs/videos/play_dodgeball.",
+)
 parser.add_argument(
     "--video_robot_env_index",
     type=int,
@@ -84,8 +111,25 @@ parser.add_argument(
     default=200,
     help="Autosave interval (steps) for trajectory plot/data snapshots.",
 )
+parser.add_argument(
+    "--curriculum_stage",
+    type=int,
+    default=None,
+    choices=[1, 2, 3, 4],
+    help=(
+        "Lock the dodgeball curriculum to a specific stage (1–4) for observation. "
+        "Stage 1: static ball, balance focus. "
+        "Stage 2: moving ball → upper-limb targets. "
+        "Stage 3: moving ball → upper-body targets. "
+        "Stage 4: moving ball → whole-body targets. "
+        "Auto-advance is disabled so the stage remains fixed."
+    ),
+)
+cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
+if args_cli.ball_speed is not None and args_cli.ball_speed <= 0.0:
+    parser.error("--ball_speed must be positive when provided.")
 if args_cli.video:
     args_cli.enable_cameras = True
 
@@ -101,27 +145,55 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from isaaclab.envs import ManagerBasedRLEnv, ManagerBasedRLEnvCfg  # noqa: E402
+from agile.rl_env.tasks.dodgeball.g1.dodgeball_env import DodgeballEnv  # noqa: E402
 from isaaclab.utils.math import subtract_frame_transforms  # noqa: E402
+from isaaclab.utils.assets import retrieve_file_path  # noqa: E402
 from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
+from isaaclab_tasks.utils import get_checkpoint_path  # noqa: E402
 from isaaclab.utils.dict import print_dict  # noqa: E402
+from rsl_rl.runners import OnPolicyRunner  # noqa: E402
 
 import agile.rl_env.tasks  # noqa: F401, E402
+from agile.rl_env.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper  # noqa: E402
 from dodgeball_plot_utils import DodgeballTrajectoryPlotter  # noqa: E402
 from dodgeball_video_utils import DodgeballVideoOverlay, configure_viewer_for_video  # noqa: E402
 
 
 def _prepare_env_cfg(env_cfg: ManagerBasedRLEnvCfg) -> ManagerBasedRLEnvCfg:
     env_cfg.curriculum = None
+    # RSL-RL checkpoints expect the same flat policy/critic tensors used during
+    # training.  Dodgeball's debug config keeps terms un-concatenated for
+    # inspection, so force the playback policy path back to runner-compatible
+    # tensors.
+    if hasattr(env_cfg, "observations"):
+        if hasattr(env_cfg.observations, "policy"):
+            env_cfg.observations.policy.concatenate_terms = True
+            env_cfg.observations.policy.flatten_history_dim = True
+        if hasattr(env_cfg.observations, "critic"):
+            env_cfg.observations.critic.concatenate_terms = True
+            env_cfg.observations.critic.flatten_history_dim = True
+
     if hasattr(env_cfg.actions, "harness"):
         del env_cfg.actions.harness
     if hasattr(env_cfg.actions, "random_upper_body_pos"):
         del env_cfg.actions.random_upper_body_pos
+
+    # ── Curriculum stage selection ────────────────────────────────────────────
+    if args_cli.curriculum_stage is not None and hasattr(env_cfg, "curriculum_start_stage"):
+        env_cfg.curriculum_start_stage = args_cli.curriculum_stage
+        # Disable auto-advance so the stage stays fixed during observation.
+        env_cfg.curriculum_auto_advance = False
+
     # Stabilize reset behavior to avoid an initial drop impulse.
     if hasattr(env_cfg, "events") and env_cfg.events is not None:
         if hasattr(env_cfg.events, "reset_dodgeball") and env_cfg.events.reset_dodgeball is not None:
             env_cfg.events.reset_dodgeball.params["debug_print_world_z"] = True
-            # For play-mode verification, randomize speed limit between curriculum bounds each reset.
-            env_cfg.events.reset_dodgeball.params["randomize_curriculum_speed_for_debug"] = True
+            # In stage 1 the ball is always static (vel=0); random speed is irrelevant.
+            # For stages 2–4, randomize speed across the stage's curriculum bounds.
+            is_stage1 = args_cli.curriculum_stage == 1
+            env_cfg.events.reset_dodgeball.params["randomize_curriculum_speed_for_debug"] = not is_stage1
+            if args_cli.ball_speed is not None:
+                env_cfg.events.reset_dodgeball.params["custom_launch_speed"] = args_cli.ball_speed
         if hasattr(env_cfg.events, "reset_base") and env_cfg.events.reset_base is not None:
             pose_range = env_cfg.events.reset_base.params.get("pose_range", {})
             velocity_range = env_cfg.events.reset_base.params.get("velocity_range", {})
@@ -171,14 +243,59 @@ def _sine_actions(timestep: int, num_envs: int, action_dim: int, dt: float, scal
 
 
 def _flatten_observation_for_policy(obs) -> torch.Tensor:
-    """Flatten dict/TensorDict observations into a single policy tensor."""
+    """Extract and flatten the policy observation group for inference."""
     if isinstance(obs, torch.Tensor):
         return obs
     if isinstance(obs, dict):
+        if "policy" in obs:
+            return _flatten_observation_for_policy(obs["policy"])
         return torch.cat([value.flatten(start_dim=1) for value in obs.values()], dim=-1)
     if hasattr(obs, "values") and callable(getattr(obs, "values", None)):
+        if "policy" in obs:
+            return _flatten_observation_for_policy(obs["policy"])
         return torch.cat([value.flatten(start_dim=1) for value in obs.values()], dim=-1)
     raise TypeError(f"Unsupported observation type for policy inference: {type(obs)}")
+
+
+def _resolve_policy_path(agent_cfg: RslRlOnPolicyRunnerCfg | None) -> str | None:
+    """Resolve an explicit policy/checkpoint path or the configured RSL-RL checkpoint."""
+    explicit_path = args_cli.policy_path or args_cli.checkpoint
+    if explicit_path:
+        return retrieve_file_path(explicit_path)
+
+    if args_cli.mode != "policy":
+        return None
+
+    if agent_cfg is None:
+        raise RuntimeError("Policy mode requires an RSL-RL agent config.")
+    log_root_path = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
+    return get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+
+
+def _load_policy(resume_path: str, env: ManagerBasedRLEnv, agent_cfg: RslRlOnPolicyRunnerCfg):
+    """Load either an exported TorchScript policy or a regular RSL-RL checkpoint."""
+    device = env.unwrapped.device
+
+    try:
+        policy = torch.jit.load(resume_path, map_location=device)
+        policy.eval()
+        print(f"[INFO] Loaded TorchScript policy from: {resume_path}")
+        return policy, None
+    except (RuntimeError, AttributeError, pickle.UnpicklingError) as exc:
+        print(f"[INFO] Not a TorchScript policy ({type(exc).__name__}); trying RSL-RL checkpoint.")
+
+    print(f"[INFO] Loading RSL-RL checkpoint from: {resume_path}")
+    runner_env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+    runner = OnPolicyRunner(
+        runner_env,
+        agent_cfg.to_dict(),
+        log_dir=None,
+        device=agent_cfg.device,
+    )
+    runner.load(resume_path, load_optimizer=False)
+    policy = runner.get_inference_policy(device=device)
+    print("[INFO] Loaded RSL-RL checkpoint for inference.")
+    return policy, runner
 
 
 def _capture_freeze_state(env: ManagerBasedRLEnv) -> dict[str, torch.Tensor]:
@@ -391,14 +508,17 @@ def main():
         env_cfg = _prepare_env_cfg(env_cfg)
     front_half_angle_deg, initial_height_m = _resolve_plot_params(env_cfg)
 
-    env = ManagerBasedRLEnv(env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    # Use DodgeballEnv (subclass of ManagerBasedRLEnv) so curriculum state is
+    # present during evaluation; falls back gracefully when use_staged_curriculum=False.
+    EnvClass = DodgeballEnv if hasattr(env_cfg, "use_staged_curriculum") else ManagerBasedRLEnv
+    env = EnvClass(env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
     if args_cli.video:
         # Overlay wrapper must be inside RecordVideo so markers are drawn before
         # RecordVideo captures the viewport frame.
         env = DodgeballVideoOverlay(env, env_index=args_cli.video_robot_env_index)
 
-        video_dir = os.path.abspath(os.path.join("logs", "videos", "play_dodgeball"))
+        video_dir = os.path.abspath(args_cli.video_dir or os.path.join("logs", "videos", "play_dodgeball"))
         video_kwargs = {
             "video_folder": video_dir,
             "step_trigger": lambda step: step == 0,
@@ -414,9 +534,25 @@ def main():
     action_dim = env.unwrapped.action_manager.total_action_dim
     device = env.unwrapped.device
 
+    _STAGE_DESCRIPTIONS = {
+        1: "Stage 1 — static ball, balance training (vel=0, randomized position)",
+        2: "Stage 2 — moving ball → upper-limb targets (head / elbows / wrists / shoulders)",
+        3: "Stage 3 — moving ball → upper-body targets (+ torso / waist)",
+        4: "Stage 4 — moving ball → whole-body targets (full body)",
+    }
+    active_stage = getattr(env.unwrapped, "curriculum_stage", args_cli.curriculum_stage)
     print(f"[INFO] Task: {args_cli.task}")
     print(f"[INFO] Mode: {args_cli.mode}")
     print(f"[INFO] Num envs: {num_envs}, action dim: {action_dim}, dt: {dt:.4f}s")
+    if args_cli.curriculum_stage is not None:
+        desc = _STAGE_DESCRIPTIONS.get(args_cli.curriculum_stage, f"Stage {args_cli.curriculum_stage}")
+        print(f"[INFO] Curriculum stage locked to {args_cli.curriculum_stage}: {desc}")
+        print("[INFO] Auto-advance disabled — stage will remain fixed during playback.")
+    elif active_stage is not None:
+        desc = _STAGE_DESCRIPTIONS.get(active_stage, f"Stage {active_stage}")
+        print(f"[INFO] Curriculum stage (from config): {active_stage}: {desc}")
+    if args_cli.ball_speed is not None:
+        print(f"[INFO] Fixed dodgeball launch speed override: {args_cli.ball_speed:.2f} m/s")
     if args_cli.freeze_robot:
         print("[INFO] Freeze mode enabled: robot actions are fixed at zero.")
 
@@ -425,10 +561,16 @@ def main():
         print(f"[INFO] Trajectory plotting enabled. Autosave every {args_cli.traj_plot_autosave_steps} steps.")
 
     policy = None
-    if not args_cli.freeze_robot and args_cli.policy_path:
-        policy = torch.jit.load(args_cli.policy_path, map_location=device)
-        policy.eval()
-        print(f"[INFO] Loaded TorchScript policy from: {args_cli.policy_path}")
+    ppo_runner = None
+    agent_cfg = None
+    if not args_cli.freeze_robot and (args_cli.mode == "policy" or args_cli.policy_path or args_cli.checkpoint):
+        agent_cfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
+        resume_path = _resolve_policy_path(agent_cfg)
+        if resume_path is None:
+            raise RuntimeError("Policy mode requires --checkpoint, --policy_path, or RSL-RL --load_run/--checkpoint config.")
+        policy, ppo_runner = _load_policy(resume_path, env, agent_cfg)
+    elif args_cli.freeze_robot and (args_cli.policy_path or args_cli.checkpoint):
+        print("[INFO] Policy path/checkpoint was provided but --freeze-robot is enabled; policy will not be used.")
 
     timestep = 0
     try:
@@ -468,6 +610,20 @@ def main():
                 # Per-step COM/support-polygon diagnostics for the first 50 steps
                 if timestep < 50:
                     _print_com_diag(env, timestep, env_idx=args_cli.video_robot_env_index)
+
+                # Print curriculum status every 200 steps.
+                if timestep % 200 == 0:
+                    base_env = env.unwrapped
+                    cur_stage = getattr(base_env, "curriculum_stage", args_cli.curriculum_stage)
+                    log = info.get("log", {})
+                    speed_str = f"{log.get('curriculum/max_launch_speed', float('nan')):.2f} m/s"
+                    sr_str = f"{log.get('curriculum/stage_success_rate', float('nan')):.1%}"
+                    print(
+                        f"[CURRICULUM step={timestep:5d}]"
+                        f"  stage={cur_stage}"
+                        f"  max_speed={speed_str}"
+                        f"  success_rate={sr_str}"
+                    )
 
                 if traj_plotter is not None:
                     rel_pos_local = _get_ball_in_humanoid_frame(env).detach().cpu().numpy()

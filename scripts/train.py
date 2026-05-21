@@ -53,6 +53,26 @@ parser.add_argument("--num_envs", type=int, default=None, help="Number of enviro
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
+parser.add_argument(
+    "--curriculum_start_stage",
+    type=int,
+    default=None,
+    choices=[1, 2, 3, 4],
+    help="Starting curriculum stage for dodgeball training (1–4). Only applies to tasks that support staged curricula.",
+)
+parser.add_argument(
+    "--use_cbf",
+    action="store_true",
+    help="Enable the optional dodgeball CBF action filter. By default, dodgeball trains with plain PPO.",
+)
+parser.add_argument(
+    "--reset_iteration_on_resume",
+    action="store_true",
+    help=(
+        "After loading a checkpoint, reset the RSL-RL runner iteration to 0. "
+        "Use for branch fine-tuning from a policy checkpoint rather than exact continuation."
+    ),
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -123,6 +143,17 @@ def main(
     agent_cfg.max_iterations = (
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
     )
+    if args_cli.curriculum_start_stage is not None and hasattr(env_cfg, "curriculum_start_stage"):
+        env_cfg.curriculum_start_stage = args_cli.curriculum_start_stage
+    if hasattr(agent_cfg, "cbf_cfg") and agent_cfg.cbf_cfg is not None and not args_cli.use_cbf:
+        agent_cfg.cbf_cfg.enabled = False
+        if hasattr(agent_cfg.algorithm, "cbf_safe_action_loss_coef"):
+            agent_cfg.algorithm.cbf_safe_action_loss_coef = 0.0
+        if hasattr(agent_cfg.algorithm, "cbf_reward_penalty_coef"):
+            agent_cfg.algorithm.cbf_reward_penalty_coef = 0.0
+        print("[INFO] CBF disabled; training with plain PPO. Pass --use_cbf to enable PPO + CBF.")
+    elif hasattr(agent_cfg, "cbf_cfg") and agent_cfg.cbf_cfg is not None and args_cli.use_cbf:
+        print("[INFO] CBF enabled; training with PPO + CBF action filtering.")
 
     # update frequency in case it is overridden (requires physics_freq and controller_freq to be set in the task config)
     if any("physics_freq" in arg or "controller_freq" in arg for arg in hydra_args):
@@ -171,6 +202,7 @@ def main(
         env = multi_agent_to_single_agent(env)
 
     # save resume path before creating a new log_dir
+    resume_path = None
     if agent_cfg.resume:
         if os.path.isfile(agent_cfg.load_checkpoint):
             resume_path = os.path.abspath(agent_cfg.load_checkpoint)
@@ -219,9 +251,18 @@ def main(
     runner.add_git_repo_to_log(__file__)
     # load the checkpoint
     if agent_cfg.resume:
+        target_stage = getattr(env_cfg, "curriculum_start_stage", None)
+        print("[INFO] Resume configuration:")
+        print(f"  checkpoint: {resume_path}")
+        print(f"  target curriculum stage: {target_stage if target_stage is not None else 'n/a'}")
+        print(f"  load optimizer: {agent_cfg.load_optimizer}")
+        print(f"  reset runner iteration: {args_cli.reset_iteration_on_resume}")
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
         runner.load(resume_path, load_optimizer=agent_cfg.load_optimizer)
+        if args_cli.reset_iteration_on_resume:
+            runner.current_learning_iteration = 0
+            print("[INFO] Runner iteration reset to 0 for branch fine-tuning.")
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

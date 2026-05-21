@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import torch
 
 import isaaclab.utils.math as math_utils
@@ -23,6 +22,8 @@ from isaaclab.managers import EventTermCfg, ManagerTermBase, SceneEntityCfg
 from isaaclab.sensors import ContactSensor, RayCaster
 from isaaclab.utils.math import subtract_frame_transforms
 
+from agile.rl_env.mdp.dodgeball_contact import dodgeball_robot_contact
+from agile.rl_env.mdp.rewards.dodgeball_rewards import com_support_polygon_distance
 from agile.rl_env.mdp.utils import get_robot_cfg
 
 
@@ -597,10 +598,15 @@ def ball_hit_protected_body(
     robot: Articulation = env.scene[asset_cfg.name]
 
     ball_pos_w = dodgeball.data.root_pos_w
-    if asset_cfg.body_ids is None or len(asset_cfg.body_ids) == 0:
+    body_ids = asset_cfg.body_ids
+    if body_ids is None:
+        protected_pos_w = robot.data.root_pos_w.unsqueeze(1)
+    elif isinstance(body_ids, slice):
+        protected_pos_w = robot.data.body_pos_w[:, body_ids, :]
+    elif len(body_ids) == 0:
         protected_pos_w = robot.data.root_pos_w.unsqueeze(1)
     else:
-        protected_pos_w = robot.data.body_pos_w[:, asset_cfg.body_ids, :]
+        protected_pos_w = robot.data.body_pos_w[:, body_ids, :]
 
     distances = torch.norm(protected_pos_w - ball_pos_w.unsqueeze(1), dim=-1)
     return torch.any(distances < distance_threshold, dim=1)
@@ -610,31 +616,153 @@ def ball_contact_protected_body(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("dodgeball_robot_contact"),
     force_threshold: float = 2.0,
+    fallback_distance_threshold: float = 0.35,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    object_cfg: SceneEntityCfg = SceneEntityCfg("dodgeball"),
 ) -> torch.Tensor:
     """Terminate if dodgeball receives robot contact force above threshold.
 
-    The contact sensor is attached to the ball and filtered to robot prims, so this
-    condition is robust to long-link geometry and avoids ground-contact false positives.
+    The shared contact helper prefers filtered ball-to-robot forces and uses a
+    proximity-gated net-force fallback so ground-only ball contact does not fire.
     """
+    return dodgeball_robot_contact(
+        env,
+        sensor_cfg=sensor_cfg,
+        force_threshold=force_threshold,
+        fallback_distance_threshold=fallback_distance_threshold,
+        asset_cfg=asset_cfg,
+        object_cfg=object_cfg,
+    )
+
+
+def _sensor_max_net_force(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Maximum net contact force reported by a sensor over its available history."""
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
-    net_contact_forces = contact_sensor.data.net_forces_w_history
+    data = contact_sensor.data
+    forces = getattr(data, "net_forces_w_history", None)
+    if forces is None or forces.numel() == 0:
+        forces = getattr(data, "net_forces_w", None)
+    if forces is None or forces.numel() == 0:
+        return torch.zeros(env.num_envs, device=env.device)
 
-    # Ball has a single rigid body in this setup; keep generic indexing fallback.
-    body_ids = sensor_cfg.body_ids
-    if body_ids is None:
-        body_force_norm = torch.norm(net_contact_forces, dim=-1)  # [N, history, bodies]
-    elif isinstance(body_ids, slice):
-        body_force_norm = torch.norm(net_contact_forces[:, :, body_ids], dim=-1)
-    else:
-        if len(body_ids) == 0:
-            body_force_norm = torch.norm(net_contact_forces, dim=-1)
-        else:
-            body_force_norm = torch.norm(net_contact_forces[:, :, body_ids], dim=-1)
+    body_ids = getattr(sensor_cfg, "body_ids", None)
+    if body_ids is not None:
+        try:
+            if forces.dim() == 4:
+                forces = forces[:, :, body_ids, :]
+            elif forces.dim() == 3:
+                forces = forces[:, body_ids, :]
+        except (IndexError, TypeError):
+            pass
 
-    max_force_over_history = torch.max(body_force_norm, dim=1)[0]
-    if max_force_over_history.ndim == 1:
-        return max_force_over_history > force_threshold
-    return torch.any(max_force_over_history > force_threshold, dim=1)
+    force_norm = torch.norm(forces, dim=-1)
+    if force_norm.dim() == 1:
+        return force_norm
+    return torch.amax(force_norm, dim=tuple(range(1, force_norm.dim())))
+
+
+class ball_rested_settle_done(ManagerTermBase):
+    """Terminate after the ball rests on the ground and the robot settles.
+
+    This replaces the old torso-local "ball passed behind robot" check with a
+    world/contact based condition that is insensitive to robot yaw during evasive
+    motion.
+    """
+
+    def __init__(self, cfg: EventTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self.in_settle = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        self.settle_timer = torch.zeros(env.num_envs, device=env.device)
+        self.success = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        self.failure = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        self._publish_state(env)
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        object_cfg: SceneEntityCfg = SceneEntityCfg("dodgeball"),
+        asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+        sensor_cfg: SceneEntityCfg = SceneEntityCfg("dodgeball_robot_contact"),
+        support_sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_forces", body_names=".*ankle_roll_link"),
+        foot_asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=".*ankle_roll_link"),
+        settle_duration_s: float = 1.0,
+        rest_contact_force_threshold: float = 2.0,
+        rest_lin_vel_threshold: float = 0.20,
+        robot_proximity_threshold: float = 0.35,
+        support_margin: float = 0.02,
+        foot_half_len: float = 0.09,
+        foot_half_width: float = 0.045,
+        foot_toe_offset: float = 0.02,
+        force_threshold: float = 10.0,
+    ) -> torch.Tensor:
+        """Return success/failure termination after a stable post-rest settle period."""
+        self.success = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        self.failure = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+        # Stage 1 uses the frozen static ball and should never finish by ball rest.
+        if getattr(env, "curriculum_stage", None) == 1:
+            self.in_settle[:] = False
+            self.settle_timer[:] = 0.0
+            self._publish_state(env)
+            return self.success
+
+        dodgeball: RigidObject = env.scene[object_cfg.name]
+        ball_speed = torch.norm(dodgeball.data.root_lin_vel_w, dim=-1)
+        ball_net_force = _sensor_max_net_force(env, sensor_cfg)
+        ball_has_contact = ball_net_force > rest_contact_force_threshold
+        ball_is_slow = ball_speed < rest_lin_vel_threshold
+        ball_on_robot = dodgeball_robot_contact(
+            env,
+            sensor_cfg=sensor_cfg,
+            force_threshold=rest_contact_force_threshold,
+            fallback_distance_threshold=robot_proximity_threshold,
+            asset_cfg=asset_cfg,
+            object_cfg=object_cfg,
+        )
+        ball_rested_away_from_robot = ball_has_contact & ball_is_slow & ~ball_on_robot
+
+        self.in_settle |= ball_rested_away_from_robot
+
+        dist, n_contacts = com_support_polygon_distance(
+            env,
+            asset_cfg=asset_cfg,
+            sensor_cfg=support_sensor_cfg,
+            foot_asset_cfg=foot_asset_cfg,
+            foot_half_len=foot_half_len,
+            foot_half_width=foot_half_width,
+            foot_toe_offset=foot_toe_offset,
+            force_threshold=force_threshold,
+        )
+        stable = (n_contacts > 0) & (dist <= support_margin)
+
+        self.settle_timer = torch.where(
+            self.in_settle,
+            self.settle_timer + env.step_dt,
+            self.settle_timer,
+        )
+        settle_complete = self.in_settle & (self.settle_timer >= settle_duration_s)
+        self.success = settle_complete & stable
+        self.failure = settle_complete & ~stable
+
+        done = self.success | self.failure
+        self._publish_state(env)
+        return done
+
+    def reset(self, env_ids: torch.Tensor | None = None) -> None:
+        if env_ids is None:
+            env_ids = torch.arange(self._env.num_envs, device=self._env.device)
+        self.in_settle[env_ids] = False
+        self.settle_timer[env_ids] = 0.0
+        # Keep success/failure published until the wrapped env has accounted for
+        # the just-finished episode; the next __call__ refreshes them.
+
+    def _publish_state(self, env: ManagerBasedRLEnv) -> None:
+        env._dodgeball_settle_success = self.success
+        env._dodgeball_settle_failure = self.failure
+        env._dodgeball_settle_active = self.in_settle
 
 
 def ball_passed_humanoid(
@@ -643,7 +771,16 @@ def ball_passed_humanoid(
     reference_asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=["torso_link"]),
     pass_x_threshold: float = -0.15,
 ) -> torch.Tensor:
-    """Terminate if the dodgeball has passed the humanoid in torso local x-axis."""
+    """Terminate if the dodgeball has passed the humanoid in torso local x-axis.
+
+    NOTE: Currently disabled in DodgeballTerminationsCfg (set to None). Successful
+    dodges end via episode timeout; ball hits use dodgeball_hit_upper_body instead.
+    """
+    # Stage 1 uses a frozen static ball — the ball-pass condition is irrelevant
+    # and must not fire (e.g. if the robot spins or a numerical edge case occurs).
+    if getattr(env, "curriculum_stage", None) == 1:
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
     dodgeball: RigidObject = env.scene[object_cfg.name]
     robot: Articulation = env.scene[reference_asset_cfg.name]
 

@@ -362,6 +362,18 @@ class OnPolicyRunner:
                 if it % self.save_interval == 0:
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
 
+                # Per-stage best checkpoint (dodgeball curriculum).
+                env_unwrapped = self.env.unwrapped
+                if getattr(env_unwrapped, "_best_ckpt_request", None) is not None:
+                    req = env_unwrapped._best_ckpt_request
+                    best_path = os.path.join(self.log_dir, req["filename"])
+                    self.save(best_path)
+                    env_unwrapped._best_ckpt_request = None
+                    print(
+                        f"[DodgeballCurriculum] Saved best Stage {req['stage']} "
+                        f"checkpoint → {best_path}"
+                    )
+
             # Clear episode infos
             ep_infos.clear()
             # Save code state

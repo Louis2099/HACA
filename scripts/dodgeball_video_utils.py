@@ -40,6 +40,11 @@ import gymnasium as gym
 
 log = logging.getLogger(__name__)
 
+
+def _is_support_body_name(body_name: str) -> bool:
+    """Return True for bodies that should define the foot support polygon."""
+    return "ankle_roll_link" in body_name
+
 # ---------------------------------------------------------------------------
 # Camera helper — call before gym.make()
 # ---------------------------------------------------------------------------
@@ -206,6 +211,7 @@ class DodgeballVideoOverlay(gym.Wrapper):
         self._markers_init_failed = False
         # Mapping: sensor-local body index → robot body index (built on first use)
         self._sensor_to_robot_ids: list[int] | None = None
+        self._sensor_body_names: list[str] | None = None
 
     # ------------------------------------------------------------------
     # Lazy marker initialisation
@@ -331,9 +337,11 @@ class DodgeballVideoOverlay(gym.Wrapper):
                     s_names = contact_sensor.body_names
                     robot_ids, _ = robot.find_bodies(s_names, preserve_order=True)
                     self._sensor_to_robot_ids = robot_ids
+                    self._sensor_body_names = [str(name) for name in s_names]
                 except Exception as exc:
                     log.warning("DodgeballVideoOverlay: sensor→robot map failed: %s", exc)
                     self._sensor_to_robot_ids = list(range(contact_sensor.num_bodies))
+                    self._sensor_body_names = None
 
             forces_w = contact_sensor.data.net_forces_w            # [N, C, 3]
             force_norms = torch.norm(forces_w[idx], dim=-1)         # [C]
@@ -342,6 +350,13 @@ class DodgeballVideoOverlay(gym.Wrapper):
                 if local_i >= force_norms.shape[0]:
                     break
                 if float(force_norms[local_i].item()) > self._force_threshold:
+                    body_name = (
+                        self._sensor_body_names[local_i]
+                        if self._sensor_body_names is not None and local_i < len(self._sensor_body_names)
+                        else f"sensor_body_{local_i}"
+                    )
+                    if not _is_support_body_name(body_name):
+                        continue
                     bp = body_pos_w[idx, robot_body_id]
                     bq = body_quat_w[idx, robot_body_id]
                     ankle_xy = np.array(

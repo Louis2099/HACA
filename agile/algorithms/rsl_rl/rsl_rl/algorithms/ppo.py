@@ -313,6 +313,7 @@ class PPO:
             mean_cbf_safe_action_loss = 0
         else:
             mean_cbf_safe_action_loss = None
+        skipped_updates = 0
 
         # generator for mini batches
         if self.policy.is_recurrent:
@@ -464,14 +465,6 @@ class PPO:
                 cbf_safe_action_loss = torch.mean(torch.square(mu_batch - actions_batch.detach()))
                 loss += self.cbf_safe_action_loss_coef * cbf_safe_action_loss
 
-            if loss.abs().max() > 1000.0 or loss.isnan().any():
-                print(f"Loss is greater than 1000: {loss.mean()}")
-                print(f"Surrogate loss: {surrogate_loss.mean()}")
-                print(f"Value loss: {value_loss.mean()}")
-                print(f"Entropy loss: {entropy_batch.mean()}")
-                print(f"Advantages: {advantages_batch.mean()}")
-                print(f"Returns: {returns_batch.mean()}")
-
             # Symmetry loss
             if self.symmetry:
                 # obtain the symmetric actions
@@ -549,6 +542,22 @@ class PPO:
                 loss += self.lambda_actor * l2c2_actor_loss
                 loss += self.lambda_critic * l2c2_critic_loss
 
+            non_finite_loss = not bool(torch.isfinite(loss).all().item())
+            large_loss = bool((loss.detach().abs().max() > 1000.0).item()) if not non_finite_loss else False
+            if non_finite_loss or large_loss:
+                print(f"Loss is greater than 1000 or non-finite: {loss.mean()}")
+                print(f"Surrogate loss: {surrogate_loss.mean()}")
+                print(f"Value loss: {value_loss.mean()}")
+                print(f"Entropy loss: {entropy_batch.mean()}")
+                print(f"Advantages: {advantages_batch.mean()}")
+                print(f"Returns: {returns_batch.mean()}")
+                if non_finite_loss:
+                    skipped_updates += 1
+                    self.optimizer.zero_grad(set_to_none=True)
+                    if self.rnd_optimizer:
+                        self.rnd_optimizer.zero_grad(set_to_none=True)
+                    continue
+
             # Compute the gradients
             # -- For PPO
             self.optimizer.zero_grad()
@@ -588,21 +597,27 @@ class PPO:
                 mean_cbf_safe_action_loss += cbf_safe_action_loss.item()
         # -- For PPO
         num_updates = self.num_learning_epochs * self.num_mini_batches
-        mean_value_loss /= num_updates
-        mean_surrogate_loss /= num_updates
-        mean_entropy /= num_updates
+        valid_updates = num_updates - skipped_updates
+        if valid_updates == 0:
+            print("[PPO] WARNING: skipped every minibatch because the loss was non-finite.")
+            valid_updates = 1
+        elif skipped_updates > 0:
+            print(f"[PPO] WARNING: skipped {skipped_updates}/{num_updates} minibatches with non-finite loss.")
+        mean_value_loss /= valid_updates
+        mean_surrogate_loss /= valid_updates
+        mean_entropy /= valid_updates
         # -- For RND
         if mean_rnd_loss is not None:
-            mean_rnd_loss /= num_updates
+            mean_rnd_loss /= valid_updates
         # -- For Symmetry
         if mean_symmetry_loss is not None:
-            mean_symmetry_loss /= num_updates
+            mean_symmetry_loss /= valid_updates
         # -- For L2C2
         if mean_l2c2_actor_loss is not None:
-            mean_l2c2_actor_loss /= num_updates
-            mean_l2c2_critic_loss /= num_updates
+            mean_l2c2_actor_loss /= valid_updates
+            mean_l2c2_critic_loss /= valid_updates
         if mean_cbf_safe_action_loss is not None:
-            mean_cbf_safe_action_loss /= num_updates
+            mean_cbf_safe_action_loss /= valid_updates
         # -- Clear the storage
         self.storage.clear()
 

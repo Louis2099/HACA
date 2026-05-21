@@ -20,6 +20,7 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 
+from agile.rl_env.mdp.dodgeball_contact import dodgeball_robot_contact
 from agile.rl_env.mdp.observations.dodgeball_observations import ball_pos_rel_root, ball_vel_rel_root
 
 
@@ -148,33 +149,61 @@ def ball_robot_contact_penalty(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("dodgeball_robot_contact"),
     force_threshold: float = 2.0,
+    fallback_distance_threshold: float = 0.35,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    object_cfg: SceneEntityCfg = SceneEntityCfg("dodgeball"),
 ) -> torch.Tensor:
     """Binary penalty when the dodgeball contacts robot above threshold force.
 
-    This sensor is attached to the ball and filtered to robot prim paths, so
-    ground contacts are excluded.
+    Ground-only ball contacts are rejected by the shared contact helper's
+    robot-proximity-gated net-force fallback.
     """
-    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
-    net_contact_forces = contact_sensor.data.net_forces_w_history
+    return dodgeball_robot_contact(
+        env,
+        sensor_cfg=sensor_cfg,
+        force_threshold=force_threshold,
+        fallback_distance_threshold=fallback_distance_threshold,
+        asset_cfg=asset_cfg,
+        object_cfg=object_cfg,
+    ).float()
 
-    body_ids = sensor_cfg.body_ids
-    if body_ids is None:
-        force_norm = torch.norm(net_contact_forces, dim=-1)  # [N, history, bodies]
-    elif isinstance(body_ids, slice):
-        force_norm = torch.norm(net_contact_forces[:, :, body_ids], dim=-1)
-    else:
-        if len(body_ids) == 0:
-            force_norm = torch.norm(net_contact_forces, dim=-1)
+
+def self_collision_penalty(
+    env: ManagerBasedRLEnv,
+    sensor_names: tuple[str, ...] | list[str],
+    force_threshold: float = 5.0,
+    force_scale: float = 100.0,
+) -> torch.Tensor:
+    """Penalty for filtered robot link-link contact forces.
+
+    Each configured sensor is expected to be a one-to-many ContactSensor whose
+    source is a single robot link and whose filters target robot links. The
+    filtered force matrix excludes ground and dodgeball contacts by construction.
+    """
+    penalty = torch.zeros(env.num_envs, device=env.device)
+    sensors = getattr(env.scene, "sensors", {})
+    scale = max(float(force_scale), 1.0e-6)
+
+    for sensor_name in sensor_names:
+        sensor = sensors.get(sensor_name, None)
+        if sensor is None:
+            continue
+        force_matrix = getattr(sensor.data, "force_matrix_w", None)
+        if force_matrix is None or force_matrix.numel() == 0:
+            continue
+
+        force_norm = torch.norm(force_matrix, dim=-1)
+        reduce_dims = tuple(range(1, force_norm.dim()))
+        if len(reduce_dims) == 0:
+            max_force = force_norm
         else:
-            force_norm = torch.norm(net_contact_forces[:, :, body_ids], dim=-1)
+            max_force = torch.amax(force_norm, dim=reduce_dims)
+        penalty = penalty + torch.clamp((max_force - force_threshold) / scale, min=0.0, max=1.0)
 
-    max_force_over_history = torch.max(force_norm, dim=1)[0]
-    if max_force_over_history.ndim == 1:
-        return (max_force_over_history > force_threshold).float()
-    return torch.any(max_force_over_history > force_threshold, dim=1).float()
+    return penalty
 
 
-def com_balance_reward(
+def com_support_polygon_distance(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),      # noqa: B008
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_forces"),  # noqa: B008
@@ -182,11 +211,9 @@ def com_balance_reward(
     foot_half_len: float = 0.08,
     foot_half_width: float = 0.04,
     foot_toe_offset: float = 0.02,
-    sigma: float = 0.1,
     force_threshold: float = 5.0,
-    grace_steps: int = 10,
-) -> torch.Tensor:
-    """Reward the robot for keeping its CoM projection inside the support polygon.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Distance from projected CoM to the active rectangular-foot support hull.
 
     Each grounded foot is modelled as a rectangular contact patch centred on the
     ankle link, with dimensions ``foot_half_len × foot_half_width`` (half-extents),
@@ -195,15 +222,8 @@ def com_balance_reward(
 
     - Two feet grounded: convex hull of 8 corners (both patches + area between them).
     - One foot grounded: convex hull of 4 corners (that foot's patch alone).
-    - No feet grounded: reward = 0.
-
-    Reward kernel (HuB, Zhang et al., CoRL 2025):
-        r = exp(-dist² / σ²)
-    where ``dist`` is 0 when the CoM projection is inside the hull and is the
-    minimum boundary distance otherwise.
-
-    A ``grace_steps`` window after each reset returns 1.0 unconditionally, covering
-    the ~7-step airborne settling phase before the robot establishes contacts.
+    - No feet grounded: distance is computed against the two-foot hull but the
+      returned contact count is zero so callers can reject the state.
 
     Args:
         env: The RL environment.
@@ -215,20 +235,15 @@ def com_balance_reward(
         foot_toe_offset: Forward shift (m) of the patch centre in foot local x.
             Use a positive value when the ankle link is closer to the heel.
             Effective extent: heel = half_len − offset, toe = half_len + offset.
-        sigma: Exponential kernel width (m).  0.1 m following HuB.
         force_threshold: Minimum contact force (N) to treat a foot as grounded.
-        grace_steps: Post-reset grace period (steps) returning reward = 1.0.
 
     Returns:
-        Reward tensor shape [num_envs] in [0, 1].
+        Tuple ``(dist, n_contacts)`` where ``dist`` is zero inside the active
+        support hull and positive outside, and ``n_contacts`` is the number of
+        grounded feet.
     """
     robot: Articulation = env.scene[asset_cfg.name]
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
-
-    # Grace period — robot settles from z≈0.9 m, contacts appear after ~7 steps.
-    in_grace = env.episode_length_buf < grace_steps  # [N]
-    if in_grace.all():
-        return torch.ones(env.num_envs, device=env.device)
 
     # ── 1. CoM XY projection ──────────────────────────────────────────────────
     # default_mass lives on CPU at load time; move to simulation device.
@@ -272,6 +287,47 @@ def com_balance_reward(
            torch.where(only_R,         dist_R,
                                        dist_both)))   # n_contacts==0 masked below
 
+    return dist, n_contacts
+
+
+def com_balance_reward(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),      # noqa: B008
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_forces"),  # noqa: B008
+    foot_asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),  # noqa: B008
+    foot_half_len: float = 0.08,
+    foot_half_width: float = 0.04,
+    foot_toe_offset: float = 0.02,
+    sigma: float = 0.1,
+    force_threshold: float = 5.0,
+    grace_steps: int = 10,
+) -> torch.Tensor:
+    """Reward the robot for keeping its CoM projection inside the support polygon.
+
+    Reward kernel (HuB, Zhang et al., CoRL 2025):
+        r = exp(-dist² / σ²)
+    where ``dist`` is 0 when the CoM projection is inside the hull and is the
+    minimum boundary distance otherwise.
+
+    A ``grace_steps`` window after each reset returns 1.0 unconditionally, covering
+    the ~7-step airborne settling phase before the robot establishes contacts.
+    """
+    # Grace period — robot settles from z≈0.9 m, contacts appear after ~7 steps.
+    in_grace = env.episode_length_buf < grace_steps  # [N]
+    if in_grace.all():
+        return torch.ones(env.num_envs, device=env.device)
+
+    dist, n_contacts = com_support_polygon_distance(
+        env,
+        asset_cfg=asset_cfg,
+        sensor_cfg=sensor_cfg,
+        foot_asset_cfg=foot_asset_cfg,
+        foot_half_len=foot_half_len,
+        foot_half_width=foot_half_width,
+        foot_toe_offset=foot_toe_offset,
+        force_threshold=force_threshold,
+    )
+
     # ── 5. Reward ─────────────────────────────────────────────────────────────
     # dist == 0 when CoM projection is inside the hull → reward = 1.0.
     # Decays exponentially with distance outside the hull.
@@ -279,6 +335,47 @@ def com_balance_reward(
     reward = torch.where(n_contacts == 0, torch.zeros_like(reward), reward)
     reward = torch.where(in_grace,        torch.ones_like(reward),  reward)
     return reward
+
+
+def dodgeball_settle_success_reward(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Terminal success indicator for the ball-rested settle termination."""
+    success = getattr(env, "_dodgeball_settle_success", None)
+    if success is None:
+        return torch.zeros(env.num_envs, device=env.device)
+    return success.float()
+
+
+def dodgeball_settle_failure_penalty(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Terminal balance-failure indicator during the post-ball-rest settle period."""
+    failure = getattr(env, "_dodgeball_settle_failure", None)
+    if failure is None:
+        return torch.zeros(env.num_envs, device=env.device)
+    return failure.float()
+
+
+def dodgeball_non_settle_termination_penalty(
+    env: ManagerBasedRLEnv,
+    excluded_term_names: tuple[str, ...] | list[str] = ("dodgeball_passed_humanoid",),
+) -> torch.Tensor:
+    """Termination indicator excluding the rested-settle success/failure term.
+
+    The dodgeball settle term carries its own small terminal reward/penalty.
+    Other early terminations, such as a hit or fall, keep the inherited large
+    failure penalty.
+    """
+    termination_manager = env.termination_manager
+    terminated = termination_manager.terminated
+    excluded = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+    term_dones = getattr(termination_manager, "_term_dones", None)
+    idx_map = getattr(termination_manager, "_term_name_to_term_idx", {})
+    if term_dones is not None:
+        for term_name in excluded_term_names:
+            idx = idx_map.get(term_name, None)
+            if idx is not None:
+                excluded |= term_dones[:, idx]
+
+    return (terminated & ~excluded).float()
 
 
 def foot_locomotion_penalty(

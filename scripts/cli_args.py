@@ -23,6 +23,20 @@ if TYPE_CHECKING:
     from agile.rl_env.rsl_rl import RslRlOnPolicyRunnerCfg
 
 
+def str_to_bool(value: bool | str) -> bool:
+    """Parse a CLI boolean without Python's ``bool("False") == True`` footgun."""
+    if isinstance(value, bool):
+        return value
+    value_lower = value.lower()
+    if value_lower in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if value_lower in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(
+        f"Expected a boolean value, got '{value}'. Use true/false, yes/no, or 1/0."
+    )
+
+
 def add_rsl_rl_args(parser: argparse.ArgumentParser):
     """Add RSL-RL arguments to the parser.
 
@@ -45,7 +59,7 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
         help="Run name suffix to the log directory.",
     )
     # -- load arguments
-    arg_group.add_argument("--resume", type=bool, default=None, help="Whether to resume from a checkpoint.")
+    arg_group.add_argument("--resume", type=str_to_bool, default=None, help="Whether to resume from a checkpoint.")
     arg_group.add_argument(
         "--load_run",
         type=str,
@@ -53,6 +67,12 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
         help="Name of the run folder to resume from.",
     )
     arg_group.add_argument("--checkpoint", type=str, default=None, help="Checkpoint file to resume from.")
+    arg_group.add_argument(
+        "--load_optimizer",
+        type=str_to_bool,
+        default=None,
+        help="Whether to load optimizer state when resuming from a checkpoint.",
+    )
     # -- logger arguments
     arg_group.add_argument(
         "--logger",
@@ -109,6 +129,8 @@ def update_rsl_rl_cfg(agent_cfg: RslRlOnPolicyRunnerCfg, args_cli: argparse.Name
         agent_cfg.load_run = args_cli.load_run
     if args_cli.checkpoint is not None:
         agent_cfg.load_checkpoint = args_cli.checkpoint
+    if getattr(args_cli, "load_optimizer", None) is not None:
+        agent_cfg.load_optimizer = args_cli.load_optimizer
     if args_cli.run_name is not None:
         agent_cfg.run_name = args_cli.run_name
     if args_cli.logger is not None:
