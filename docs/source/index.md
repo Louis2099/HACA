@@ -92,6 +92,7 @@ training-tips
 tasks
 mdp
 data-recording
+cbf-rl
 ```
 
 ```{toctree}
